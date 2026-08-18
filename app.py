@@ -6,7 +6,7 @@ import numpy as np
 st.set_page_config(page_title="Burry IV15 Screener", layout="centered")
 
 st.title("🎯 Burry IV15 Value Screener")
-st.caption("Michael Burry's True Owners' Earnings (OE) & AICT Moat Stress-Testing Engine")
+st.caption("Automated SEC EDGAR Audited Financials & AICT Moat Valuation Engine")
 
 # 1. AICT Moat Tier Rules
 AICT_TIERS = {
@@ -32,30 +32,46 @@ def get_sec_ticker_mapping():
         mapping[entry["ticker"].upper()] = str(entry["cik_str"]).zfill(10)
     return mapping
 
-def extract_latest_xbrl_facts(facts_json, concept_names, taxonomy="us-gaap", is_duration=False):
+def extract_latest_xbrl_facts(facts_json, concept_names, taxonomy="us-gaap", is_flow=False):
     if "facts" not in facts_json or taxonomy not in facts_json["facts"]:
         return 0.0
+    
     for concept in concept_names:
         if concept in facts_json["facts"][taxonomy]:
             units = facts_json["facts"][taxonomy][concept].get("units", {})
             values = units.get("USD", units.get("shares", []))
-            if is_duration:
-                reports = [v for v in values if v.get("form") in ["10-K", "10-K/A"] and v.get("fp") in ["FY", "CY"]]
-                if not reports:
-                    reports = [v for v in values if v.get("form") in ["10-K", "10-K/A", "10-Q", "10-Q/A"]]
+            
+            if is_flow:
+                # Flow items (Net Income, SBC, Buybacks): Must be 10-K full year filings (FY / CY)
+                annual_reports = [
+                    v for v in values 
+                    if v.get("form") in ["10-K", "10-K/A"] 
+                    and v.get("fp") in ["FY", "CY"]
+                    and "start" in v and "end" in v
+                ]
+                if annual_reports:
+                    # Sort by the period end date to get the latest completed fiscal year
+                    annual_reports.sort(key=lambda x: x.get("end", ""))
+                    return float(annual_reports[-1].get("val", 0.0))
             else:
-                reports = [v for v in values if v.get("form") in ["10-K", "10-K/A", "10-Q", "10-Q/A"]]
-            if reports:
-                reports.sort(key=lambda x: x.get("end", ""))
-                return float(reports[-1].get("val", 0.0))
+                # Balance sheet & Shares items: Latest available point-in-time filing (10-K or 10-Q)
+                point_in_time = [v for v in values if v.get("form") in ["10-K", "10-K/A", "10-Q", "10-Q/A"]]
+                if point_in_time:
+                    point_in_time.sort(key=lambda x: x.get("end", ""))
+                    return float(point_in_time[-1].get("val", 0.0))
     return 0.0
 
 def extract_annual_growth_rate(facts_json):
     concepts = ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"]
     for concept in concepts:
-        if "facts" in facts_json and "us-gaap" in facts_json["facts"] and concept in facts_json["facts"]["us-gaap"]:
+        if "facts" in facts_json and "us-gaap" in facts_json["facts"] and concept in facts_json["facts"][concept]:
             units = facts_json["facts"]["us-gaap"][concept].get("units", {}).get("USD", [])
-            annual = [v for v in units if v.get("form") in ["10-K", "10-K/A"] and v.get("fp") in ["FY", "CY"]]
+            annual = [
+                v for v in units 
+                if v.get("form") in ["10-K", "10-K/A"] 
+                and v.get("fp") in ["FY", "CY"]
+                and "start" in v and "end" in v
+            ]
             if len(annual) >= 2:
                 annual.sort(key=lambda x: x.get("end", ""))
                 v_latest = annual[-1].get("val", 0.0)
@@ -88,24 +104,25 @@ def fetch_sec_financials(symbol):
     
     facts = res.json()
 
-    N_raw = extract_latest_xbrl_facts(facts, ["NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLoss", "ProfitLoss"], is_duration=True)
-    G_raw = extract_latest_xbrl_facts(facts, ["AllocatedShareBasedCompensationExpense", "ShareBasedCompensation", "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense"], is_duration=True)
-    T_raw = extract_latest_xbrl_facts(facts, ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity", "PaymentsRelatedToTaxWithholdingForShareBasedCompensation"], is_duration=True)
+    # 1. Income & SBC Items (Flow metrics: full year duration only)
+    N_raw = extract_latest_xbrl_facts(facts, ["NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLoss", "ProfitLoss"], is_flow=True)
+    G_raw = extract_latest_xbrl_facts(facts, ["AllocatedShareBasedCompensationExpense", "ShareBasedCompensation", "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense"], is_flow=True)
+    T_raw = extract_latest_xbrl_facts(facts, ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity", "PaymentsRelatedToTaxWithholdingForShareBasedCompensation"], is_flow=True)
 
+    # 2. Cash & Liquid Securities
     cash_raw = extract_latest_xbrl_facts(facts, ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"])
     st_inv_raw = extract_latest_xbrl_facts(facts, ["MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesCurrent", "OtherShortTermInvestments"])
-# Ensure client fiduciary obligations are excluded from corporate debt
+
+    # 3. Funded Debt (Excludes Payroll Tax Clearing / Fiduciary Obligations)
     lt_debt = extract_latest_xbrl_facts(facts, ["LongTermDebtNoncurrent", "LongTermDebtAndCapitalLeaseObligations"])
     st_debt = extract_latest_xbrl_facts(facts, ["DebtCurrent", "ShortTermBorrowings", "CommercialPaper"])
     leases_nc = extract_latest_xbrl_facts(facts, ["OperatingLeaseLiabilityNoncurrent", "FinanceLeaseLiabilityNoncurrent"])
     leases_cur = extract_latest_xbrl_facts(facts, ["OperatingLeaseLiabilityCurrent", "FinanceLeaseLiabilityCurrent"])
     
-    # Filter out fiduciary payroll float
     total_debt_raw = lt_debt + st_debt + leases_nc + leases_cur
-    if total_debt_raw == 0.0:
-        total_debt_raw = extract_latest_xbrl_facts(facts, ["LongTermDebt", "DebtAndCapitalLeaseObligations", "LiabilitiesOtherThanLongTermDebtAndCapitalLeasesCurrent"])
 
-    shares_raw = extract_latest_xbrl_facts(facts, ["WeightedAverageNumberOfDilutedSharesOutstanding"], is_duration=True)
+    # 4. Diluted Share Count
+    shares_raw = extract_latest_xbrl_facts(facts, ["WeightedAverageNumberOfDilutedSharesOutstanding"], is_flow=True)
     if shares_raw == 0.0:
         shares_raw = extract_latest_xbrl_facts(facts, ["EntityCommonStockSharesOutstanding"], taxonomy="dei")
     if shares_raw == 0.0:
@@ -122,8 +139,8 @@ def fetch_sec_financials(symbol):
         "g1": g1
     }
 
-# Search Bar - Initialized Empty
-ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ADBE, CRM, NOW, INTU, ADSK").upper().strip()
+# Search Bar
+ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ADBE, CRM, NOW, INTU, PAYC").upper().strip()
 tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=2)
 tier = AICT_TIERS[tier_name]
 
@@ -227,7 +244,7 @@ if "calc_data" in st.session_state and ticker and st.session_state["calc_data"][
     res_c2.metric("Baseline IV15", f"${iv15_baseline:.2f}", f"P/IV15: {p_iv15:.2f}x")
     res_c3.metric("Stressed IV15", f"${stressed_iv15:.2f}", f"P/IV15: {stressed_p_iv15:.2f}x")
 
-    # Decision Banner (LaTeX Escaped)
+    # Decision Banner
     if p_iv15 <= 1.0:
         st.success(f"🎯 **FAT PITCH (BUY)**: At **\${cd['price']:.2f}**, {ticker} is priced below baseline IV15 (**\${iv15_baseline:.2f}**) and offers an estimated ≥15% annualized return.")
     elif p_iv15 <= 1.5:
