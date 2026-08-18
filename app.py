@@ -112,7 +112,7 @@ def fetch_sec_data(symbol):
     }
 
 # Search Bar
-ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. PAYC, CRM, NOW, ADBE, INTU").upper().strip()
+ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. NVDA, MSFT, TSLA, ADBE, INTU").upper().strip()
 tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=3)
 tier = AICT_TIERS[tier_name]
 
@@ -160,11 +160,12 @@ if "calc_data" in st.session_state and ticker and st.session_state["calc_data"][
     d2.metric("Dilution Tax Rate", f"{dilution_tax_rate:.1f}%", "Transfer from owners")
     d3.metric("Buyback Offset Drag", f"{buyback_treadmill_pct:.1f}%", "Used to offset SBC")
 
+    # Refined alert: Only flag high dilution if buybacks are mostly offsetting SBC AND dilution tax is high
     if buyback_treadmill_pct > 80.0:
         st.warning("⚠️ **Hamster Wheel Alert:** Over 80% of company buybacks merely neutralize employee stock grants rather than reducing share count!")
-    elif dilution_tax_rate > 25.0:
+    elif dilution_tax_rate > 30.0 and buyback_treadmill_pct > 50.0:
         st.info("ℹ️ **High Dilution Drag:** Stock-based compensation significantly reduces the earnings attributable to common shareholders.")
-
+        
     # 4. Valuation Engine Helper
     def run_valuation(oe_b, g_rate, t_rules, m_exit, s_count, c_val, d_val):
         g_two = g_rate * t_rules["mult"]
