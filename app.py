@@ -340,13 +340,35 @@ CONCEPTS = {
     "T":  (["PaymentsForRepurchaseOfCommonStock"],
            ["PaymentsToAcquireOrRedeemEntitysShares"]),
     "Cw": (["PaymentsRelatedToTaxWithholdingForShareBasedCompensation"], []),
-    "Ce": (["ProceedsFromStockOptionsExercised",
-            "ProceedsFromIssuanceOfSharesUnderIncentiveAndShareBasedCompensationPlans",
+    "Ce": (["ProceedsFromIssuanceOfSharesUnderIncentiveAndShareBasedCompensationPlans",
+            "ProceedsFromStockOptionsExercised",
+            "ProceedsFromIssuanceOfTreasuryStock",
+            "ProceedsFromSaleOfTreasuryStock",
+            "ProceedsFromStockPlans",
+            "ProceedsFromEmployeeStockPurchasePlan",
             "ProceedsFromIssuanceOfCommonStock"],
            []),
-    "W":  (["StockRepurchasedAndRetiredDuringPeriodShares",
+    "W":  (["TreasuryStockSharesAcquired",
+            "StockRepurchasedAndRetiredDuringPeriodShares",
             "StockRepurchasedDuringPeriodShares",
-            "TreasuryStockSharesAcquired"], []),
+            "TreasuryStockValueAcquiredCostMethodShares",
+            "PaymentsForRepurchaseOfCommonStockShares"], []),
+    "REV": (["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues",
+             "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet"],
+            ["Revenue"]),
+    "SHD": (["WeightedAverageNumberOfDilutedSharesOutstanding",
+             "WeightedAverageNumberOfSharesOutstandingDiluted"], []),
+}
+
+BALANCE = {
+    "cash": ["CashAndCashEquivalentsAtCarryingValue",
+             "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
+    "sti":  ["ShortTermInvestments", "MarketableSecuritiesCurrent",
+             "AvailableForSaleSecuritiesDebtSecuritiesCurrent", "OtherShortTermInvestments"],
+    "lti":  ["MarketableSecuritiesNoncurrent",
+             "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent"],
+    "ltd":  ["LongTermDebtNoncurrent", "LongTermDebt"],
+    "std":  ["LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings", "CommercialPaper"],
 }
 
 SHARE_CONCEPTS = ["CommonStockSharesOutstanding", "CommonStockSharesIssued",
@@ -426,6 +448,32 @@ def _instant_share_counts(facts: dict) -> dict[int, float]:
     return {k: v[1] for k, v in out.items()}
 
 
+def _latest_instant(facts: dict, concepts: list[str]) -> float | None:
+    """Most recent instant (balance-sheet) value for the first concept found."""
+    best = None
+    for taxonomy in ("us-gaap", "ifrs-full"):
+        tax = facts.get("facts", {}).get(taxonomy, {})
+        for concept in concepts:
+            if concept not in tax:
+                continue
+            for row in tax[concept].get("units", {}).get("USD", []):
+                if row.get("start") or not row.get("end"):
+                    continue
+                if best is None or row["end"] > best[0]:
+                    best = (row["end"], float(row.get("val", 0.0)))
+            if best:
+                return best[1]
+    return None
+
+
+def fetch_balance(facts: dict) -> dict:
+    """Net cash and diluted share count, so these are never left at a placeholder."""
+    g = lambda ks: (_latest_instant(facts, ks) or 0.0) / 1e6
+    cash = g(BALANCE["cash"]) + g(BALANCE["sti"]) + g(BALANCE["lti"])
+    debt = g(BALANCE["ltd"]) + g(BALANCE["std"])
+    return {"cash": cash, "debt": debt, "net_cash": cash - debt}
+
+
 def fetch_years(ticker: str, n_years: int = 10) -> tuple[list[YearInputs], dict[str, list[int]]]:
     """Returns (years, missing) where `missing` maps each variable to the
     fiscal years it could not be resolved for. Nothing is silently zeroed."""
@@ -470,7 +518,20 @@ def fetch_years(ticker: str, n_years: int = 10) -> tuple[list[YearInputs], dict[
             Cw=grab("Cw"),
             Ce=grab("Ce"),
         ))
-    return years, {k: v for k, v in missing.items() if v}
+
+    # Prefills, so no valuation input is left at a placeholder.
+    bal = fetch_balance(facts)
+    sh_d = series.get("SHD", {})
+    diluted = (sh_d.get(fys[-1]) or shares.get(fys[-1]) or 0.0) / 1e6
+    rev = series.get("REV", {})
+    rev_yrs = sorted(rev)
+    growth = None
+    if len(rev_yrs) >= 4:
+        a, b = rev[rev_yrs[-4]], rev[rev_yrs[-1]]
+        if a > 0 and b > 0:
+            growth = (b / a) ** (1 / 3) - 1
+    bal.update({"diluted_shares": diluted, "rev_growth": growth})
+    return years, {k: v for k, v in missing.items() if v}, bal
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -562,9 +623,10 @@ with tab_fetch:
     if st.button("Pull 10-K data", type="primary") and ticker:
         try:
             with st.spinner(f"Reading {ticker} filings…"):
-                years, missing = fetch_years(ticker, int(n_years))
+                years, missing, prefill = fetch_years(ticker, int(n_years))
             st.session_state["years"] = years
             st.session_state["missing"] = missing
+            st.session_state["prefill"] = prefill
             st.session_state["ticker"] = ticker
         except Exception as e:
             st.error(str(e))
@@ -588,10 +650,12 @@ with tab_manual:
             ))
         st.session_state["years"] = rows
         st.session_state["missing"] = {}
+        st.session_state["prefill"] = {}
         st.session_state["ticker"] = "MANUAL"
 
 years = st.session_state.get("years", [])
 missing = st.session_state.get("missing", {})
+prefill = st.session_state.get("prefill", {})
 ticker = st.session_state.get("ticker", "")
 
 if years:
@@ -668,14 +732,22 @@ if years:
         oe = st.number_input("Owners' earnings ($M)", value=float(round(default_oe, 1)), step=1.0,
                              help="Normalise further for maintenance capex, working capital and "
                                   "one-offs before relying on this.")
-        shares = st.number_input("Diluted shares (M)", value=100.0, step=1.0)
+        _sh = prefill.get("diluted_shares") or 0.0
+        shares = st.number_input(
+            "Diluted shares (M)", value=float(round(_sh, 1)) if _sh > 0 else 0.0, step=1.0,
+            help="Pulled from the filings. Check it — this divides everything, so a wrong "
+                 "figure scales IV15 by exactly the same factor.")
     with v2:
         tier = st.selectbox("AICT tier", list(AICT.keys()), index=2,
                             format_func=lambda t: f"{t} — {TIER_BLURB[t]}")
-        g1 = st.number_input("Stage 1 growth (%)", value=8.0, step=0.5,
-                             help="ROIC is the ceiling — a company cannot outgrow it forever.") / 100
+        _g = prefill.get("rev_growth")
+        g1 = st.number_input(
+            "Stage 1 growth (%)", value=round((_g if _g is not None else 0.08) * 100, 1), step=0.5,
+            help="Seeded from 3-year revenue CAGR — a starting point, not an answer. Owners' "
+                 "earnings growth is what matters, and ROIC is the ceiling: a company cannot "
+                 "outgrow its return on capital forever.") / 100
     with v3:
-        net_cash = st.number_input("Net cash ($M)", value=0.0, step=10.0,
+        net_cash = st.number_input("Net cash ($M)", value=float(round(prefill.get("net_cash", 0.0), 1)), step=10.0,
                                    help="Subtract only what is freely deployable. Restricted, "
                                         "regulated and operationally-tied cash funds the business.")
         price = st.number_input("Price", value=float(fetch_price(ticker) or 100.0), step=0.01)
@@ -699,6 +771,19 @@ if years:
     p = IVParams(owners_earnings=oe, shares=shares, tier=tier, stage1_growth=g1,
                  net_cash=net_cash, exit_multiple=exit_m, blend_model1=blend,
                  stage0_years=int(s0y), stage0_growth=s0g)
+
+    if shares <= 0:
+        st.error("Enter the diluted share count before valuing. It could not be read from the "
+                 "filings, and everything below is divided by it.")
+        st.stop()
+
+    implied_cap = shares * price / 1000.0
+    if prefill.get("diluted_shares") and abs(shares / prefill["diluted_shares"] - 1) > 0.10:
+        st.warning(f"Share count differs by more than 10% from the filings "
+                   f"({prefill['diluted_shares']:,.1f}M). IV15 scales inversely with this.")
+    st.caption(f"Sanity check — implied market cap: ${implied_cap:,.1f}B "
+               f"({shares:,.1f}M shares x ${price:,.2f}). If that is not roughly the real market "
+               f"cap, the share count is wrong and every figure below is wrong by the same factor.")
 
     ladder = iv_ladder(p)
     iv15 = ladder[15]
