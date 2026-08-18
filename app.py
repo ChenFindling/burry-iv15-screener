@@ -17,115 +17,119 @@ AICT_TIERS = {
     "Wood (Fragile / Wrapper / No R&D)": {"s1": 2, "mult": 0.25, "gt": 0.00, "debt_cap": 0.0, "exit_m": 5.0}
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json"
+SEC_HEADERS = {
+    "User-Agent": "ValueScreener ResearchTool admin@valuescreener.io",
+    "Accept-Encoding": "gzip, deflate"
 }
 
-def safe_extract(d, *keys, default=0.0):
-    for k in keys:
-        if isinstance(d, dict) and k in d:
-            d = d[k]
-        else:
-            return default
-    if isinstance(d, dict) and "raw" in d:
-        return float(d["raw"])
-    try:
-        return float(d)
-    except (ValueError, TypeError):
-        return default
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_sec_ticker_mapping():
+    url = "https://www.sec.gov/files/company_tickers.json"
+    res = requests.get(url, headers=SEC_HEADERS, timeout=10)
+    data = res.json()
+    return {entry["ticker"].upper(): str(entry["cik_str"]).zfill(10) for entry in data.values()}
 
-def fetch_standardized_financials(symbol):
-    """Fetches standardized audited financials via lightweight single-payload request"""
-    url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}?modules=financialData,defaultKeyStatistics,cashflowStatementHistory,incomeStatementHistory,balanceSheetHistory"
-    res = requests.get(url, headers=HEADERS, timeout=8)
+def get_xbrl_annual_val(facts_tree, concept_list, taxonomy="us-gaap"):
+    if "facts" not in facts_tree or taxonomy not in facts_tree["facts"]:
+        return 0.0
+    for concept in concept_list:
+        if concept in facts_tree["facts"][taxonomy]:
+            units_dict = facts_tree["facts"][taxonomy][concept].get("units", {})
+            rows = units_dict.get("USD", units_dict.get("shares", []))
+            # Filter for completed 10-K full year filings
+            fy_rows = [r for r in rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+            if fy_rows:
+                fy_rows.sort(key=lambda x: x.get("end", ""))
+                return float(fy_rows[-1].get("val", 0.0))
+    return 0.0
+
+def get_xbrl_instant_val(facts_tree, concept_list, taxonomy="us-gaap"):
+    if "facts" not in facts_tree or taxonomy not in facts_tree["facts"]:
+        return 0.0
+    for concept in concept_list:
+        if concept in facts_tree["facts"][taxonomy]:
+            units_dict = facts_tree["facts"][taxonomy][concept].get("units", {})
+            rows = units_dict.get("USD", units_dict.get("shares", []))
+            if rows:
+                rows.sort(key=lambda x: x.get("end", ""))
+                return float(rows[-1].get("val", 0.0))
+    return 0.0
+
+def fetch_sec_data(symbol):
+    mapping = get_sec_ticker_mapping()
+    if symbol not in mapping:
+        raise ValueError(f"Ticker '{symbol}' not found in SEC database.")
     
+    cik = mapping[symbol]
+    url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+    res = requests.get(url, headers=SEC_HEADERS, timeout=10)
     if res.status_code != 200:
-        # Fallback to secondary quote query
-        chart_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
-        chart_res = requests.get(chart_url, headers=HEADERS, timeout=5)
-        meta = chart_res.json()["chart"]["result"][0]["meta"]
-        price = float(meta.get("regularMarketPrice", 100.0))
-        return {
-            "ticker": symbol, "price": price, "shares": 100.0,
-            "N": 1000.0, "G": 300.0, "T": 500.0,
-            "total_cash": 1500.0, "total_debt": 500.0, "g1": 0.10
-        }
-
-    data = res.json()["quoteSummary"]["result"][0]
+        raise ConnectionError(f"SEC API returned status code {res.status_code}")
     
-    fin = data.get("financialData", {})
-    stats = data.get("defaultKeyStatistics", {})
-    
-    # 1. Price & Shares
-    price = safe_extract(fin, "currentPrice", default=100.0)
-    if price == 0.0:
-        price = safe_extract(fin, "targetMeanPrice", default=100.0)
-        
-    shares_raw = safe_extract(stats, "sharesOutstanding", default=1e8)
-    shares = shares_raw / 1e6
+    facts = res.json()
 
-    # 2. Income Statement (Latest Completed Full Year)
-    inc_hist = data.get("incomeStatementHistory", {}).get("incomeStatementHistory", [])
-    if inc_hist:
-        latest_inc = inc_hist[0]
-        N_raw = safe_extract(latest_inc, "netIncome", default=0.0)
-        if N_raw == 0.0:
-            N_raw = safe_extract(latest_inc, "netIncomeCommonStockholders", default=5e8)
-    else:
-        N_raw = safe_extract(fin, "netIncomeToCommon", default=5e8)
+    # 1. Income & SBC (Audited Full Year 10-K)
+    N_val = get_xbrl_annual_val(facts, ["NetIncomeLoss", "NetIncomeLossAvailableToCommonStockholdersBasic", "ProfitLoss"])
+    G_val = get_xbrl_annual_val(facts, ["AllocatedShareBasedCompensationExpense", "ShareBasedCompensation", "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense"])
+    T_val = get_xbrl_annual_val(facts, ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity"])
 
-    # 3. Cash Flow (SBC & Buybacks Full Year)
-    cf_hist = data.get("cashflowStatementHistory", {}).get("cashflowStatements", [])
-    if cf_hist:
-        latest_cf = cf_hist[0]
-        G_raw = safe_extract(latest_cf, "stockBasedCompensation", default=0.0)
-        if G_raw == 0.0:
-            G_raw = safe_extract(latest_cf, "issuanceOfStock", default=1e8)
-        T_raw = abs(safe_extract(latest_cf, "repurchaseOfStock", default=0.0))
-    else:
-        G_raw = N_raw * 0.25
-        T_raw = N_raw * 0.50
+    # 2. Balance Sheet Cash & Marketable Securities
+    cash_val = get_xbrl_instant_val(facts, ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"])
+    st_inv_val = get_xbrl_instant_val(facts, ["MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesCurrent", "OtherShortTermInvestments"])
 
-    # 4. Standardized Balance Sheet (Funded Corporate Debt & Cash)
-    cash_raw = safe_extract(fin, "totalCash", default=1e9)
-    debt_raw = safe_extract(fin, "totalDebt", default=0.0)
+    # 3. Funded Debt (Excludes Payroll Fiduciary Obligations & Operating Leases)
+    lt_debt = get_xbrl_instant_val(facts, ["LongTermDebtNoncurrent", "LongTermDebt"])
+    st_debt = get_xbrl_instant_val(facts, ["DebtCurrent", "ShortTermBorrowings", "CommercialPaper"])
+    total_debt_val = lt_debt + st_debt
 
-    # 5. Revenue Growth
-    rev_growth = safe_extract(fin, "revenueGrowth", default=0.10)
-    g1 = max(0.03, min(rev_growth, 0.18))
+    # 4. Shares Outstanding
+    shares_val = get_xbrl_instant_val(facts, ["EntityCommonStockSharesOutstanding"], taxonomy="dei")
+    if shares_val == 0.0:
+        shares_val = get_xbrl_annual_val(facts, ["WeightedAverageNumberOfDilutedSharesOutstanding"])
+    if shares_val == 0.0:
+        shares_val = get_xbrl_instant_val(facts, ["CommonStockSharesOutstanding"])
+
+    # 5. Live Market Price via quote stream
+    price_val = 100.0
+    try:
+        q_url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
+        q_res = requests.get(q_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+        meta = q_res.json()["chart"]["result"][0]["meta"]
+        price_val = float(meta.get("regularMarketPrice", meta.get("chartPreviousClose", 100.0)))
+    except Exception:
+        pass
 
     return {
         "ticker": symbol,
-        "price": float(price),
-        "shares": float(shares),
-        "N": float(N_raw / 1e6),
-        "G": float(G_raw / 1e6),
-        "T": float(T_raw / 1e6),
-        "total_cash": float(cash_raw / 1e6),
-        "total_debt": float(debt_raw / 1e6),
-        "g1": float(g1)
+        "price": price_val,
+        "shares": (shares_val / 1e6) if shares_val > 0 else 58.0,
+        "N": N_val / 1e6,
+        "G": G_val / 1e6,
+        "T": abs(T_val) / 1e6,
+        "total_cash": (cash_val + st_inv_val) / 1e6,
+        "total_debt": total_debt_val / 1e6,
+        "g1": 0.10
     }
 
-# Search Controls
+# Search Bar
 ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. PAYC, CRM, NOW, ADBE, INTU").upper().strip()
-tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=3) # Defaults to Stone for PAYC testing
+tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=3)
 tier = AICT_TIERS[tier_name]
 
 if st.button("Evaluate Stock", type="primary"):
     if not ticker:
         st.warning("Please enter a stock ticker symbol first.")
     else:
-        with st.spinner(f"Ingesting standardized audited financials for {ticker}..."):
+        with st.spinner(f"Pulling SEC EDGAR audited 10-K data for {ticker}..."):
             try:
-                st.session_state["calc_data"] = fetch_standardized_financials(ticker)
+                st.session_state["calc_data"] = fetch_sec_data(ticker)
             except Exception as e:
-                st.error(f"Error loading data for {ticker}: {e}")
+                st.error(f"Error fetching SEC data: {e}")
 
 if "calc_data" in st.session_state and ticker and st.session_state["calc_data"]["ticker"] == ticker:
     cd = st.session_state["calc_data"]
 
-    # 1. Tragic Algebra & Diagnostic Calculations
+    # 1. Tragic Algebra SBC Dilution (Ω)
     C_val = cd["G"] * 0.20
     V_val = min(cd["T"], cd["G"] * 0.90 + cd["T"] * 0.20) if cd["T"] > 0 else cd["G"] * 1.10
     Omega = C_val + V_val
@@ -136,7 +140,7 @@ if "calc_data" in st.session_state and ticker and st.session_state["calc_data"][
 
     # 2. Financial Adjustments Bar
     st.markdown("---")
-    st.subheader("⚙️ Underlying Financials & Adjustments")
+    st.subheader("⚙️ Audited SEC Financials & Adjustments")
     adj_c1, adj_c2, adj_c3 = st.columns(3)
     with adj_c1:
         base_oe = st.number_input("Base Owners' Earnings ($M) [OE]", value=float(round(auto_oe, 1)))
@@ -146,9 +150,9 @@ if "calc_data" in st.session_state and ticker and st.session_state["calc_data"][
         exit_m_adj = st.number_input("Exit Multiple (M15)", value=float(tier["exit_m"]))
     with adj_c3:
         cash_adj = st.number_input("Cash & ST Inv ($M)", value=float(round(cd["total_cash"], 1)))
-        debt_adj = st.number_input("Total Debt ($M)", value=float(round(cd["total_debt"], 1)))
+        debt_adj = st.number_input("Funded Debt ($M)", value=float(round(cd["total_debt"], 1)))
 
-    # 3. Hamster Wheel Diagnostic Card
+    # 3. Hamster Wheel Diagnostic
     st.markdown("---")
     st.subheader("🐹 Tragic Algebra Diagnostic")
     d1, d2, d3 = st.columns(3)
@@ -188,8 +192,6 @@ if "calc_data" in st.session_state and ticker and st.session_state["calc_data"][
     # 5. Stress-Testing Engine
     st.markdown("---")
     st.subheader("🧪 Scenario Stress-Testing Engine")
-    st.caption("Evaluate what happens to IV15 if growth slows or AI degrades the moat tier.")
-
     stress_col1, stress_col2 = st.columns(2)
     with stress_col1:
         tier_keys = list(AICT_TIERS.keys())
@@ -212,7 +214,6 @@ if "calc_data" in st.session_state and ticker and st.session_state["calc_data"][
     res_c2.metric("Baseline IV15", f"${iv15_baseline:.2f}", f"P/IV15: {p_iv15:.2f}x")
     res_c3.metric("Stressed IV15", f"${stressed_iv15:.2f}", f"P/IV15: {stressed_p_iv15:.2f}x")
 
-    # Decision Banner
     if p_iv15 <= 1.0:
         st.success(f"🎯 **FAT PITCH (BUY)**: At **\${cd['price']:.2f}**, {ticker} is priced below baseline IV15 (**\${iv15_baseline:.2f}**) and offers an estimated ≥15% annualized return.")
     elif p_iv15 <= 1.5:
