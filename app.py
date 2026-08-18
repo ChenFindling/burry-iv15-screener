@@ -29,77 +29,65 @@ def get_sec_ticker_mapping():
     data = res.json()
     return {entry["ticker"].upper(): str(entry["cik_str"]).zfill(10) for entry in data.values()}
 
-# --- REWRITTEN BUCKET-LEVEL SYNCHRONIZATION EXTRACTORS ---
+# --- REWRITTEN DATE SUPERIORITY EXTRACTORS ---
 def get_xbrl_annual_val(facts_tree, concept_list, taxonomy="us-gaap"):
     if "facts" not in facts_tree or taxonomy not in facts_tree["facts"]:
         return 0.0
-        
-    all_valid_rows = []
-    concept_rows_map = {}
+    
+    best_val = 0.0
+    best_date = ""
     
     for concept in concept_list:
         if concept in facts_tree["facts"][taxonomy]:
             units = facts_tree["facts"][taxonomy][concept].get("units", {})
             rows = units.get("USD", units.get("shares", []))
             
-            valid_rows = [r for r in rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+            # Gold standard: has a frame of length 6 (e.g. CY2023)
+            valid_rows = [r for r in rows if "frame" in r and len(r["frame"]) == 6]
+            if not valid_rows:
+                # Fallback: FY 10-K
+                valid_rows = [r for r in rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+                
             if valid_rows:
-                all_valid_rows.extend(valid_rows)
-                concept_rows_map[concept] = valid_rows
+                valid_rows.sort(key=lambda x: x.get("end", ""))
+                latest_row = valid_rows[-1]
+                end_date = latest_row.get("end", "")
                 
-    if not all_valid_rows:
-        return 0.0
-        
-    all_valid_rows.sort(key=lambda x: x.get("end", ""))
-    max_year = int(all_valid_rows[-1].get("end", "2000")[:4])
-    
-    for concept in concept_list:
-        if concept in concept_rows_map:
-            c_rows = concept_rows_map[concept]
-            c_rows.sort(key=lambda x: x.get("end", ""))
-            c_latest = c_rows[-1]
-            c_year = int(c_latest.get("end", "2000")[:4])
-            
-            # Strict synchronization: Tag is only valid if it matches the bucket's latest year
-            if c_year >= max_year:
-                return float(c_latest.get("val", 0.0))
-                
-    return 0.0
+                # Overrides ONLY if the date is strictly newer. 
+                # Preserves priority of earlier tags in concept_list if dates match.
+                if end_date > best_date:
+                    best_date = end_date
+                    best_val = float(latest_row.get("val", 0.0))
+                    
+    return best_val
 
 def get_xbrl_instant_val(facts_tree, concept_list, taxonomy="us-gaap"):
     if "facts" not in facts_tree or taxonomy not in facts_tree["facts"]:
         return 0.0
-        
-    all_valid_rows = []
-    concept_rows_map = {}
+    
+    best_val = 0.0
+    best_date = ""
     
     for concept in concept_list:
         if concept in facts_tree["facts"][taxonomy]:
             units = facts_tree["facts"][taxonomy][concept].get("units", {})
             rows = units.get("USD", units.get("shares", []))
             
-            valid_rows = [r for r in rows if r.get("form") in ["10-K", "10-Q", "10-K/A", "10-Q/A"]]
+            # Instant frames end with 'I'
+            valid_rows = [r for r in rows if "frame" in r and r["frame"].endswith("I")]
+            if not valid_rows:
+                valid_rows = [r for r in rows if r.get("form") in ["10-K", "10-Q", "10-K/A", "10-Q/A"]]
+                
             if valid_rows:
-                all_valid_rows.extend(valid_rows)
-                concept_rows_map[concept] = valid_rows
+                valid_rows.sort(key=lambda x: x.get("end", ""))
+                latest_row = valid_rows[-1]
+                end_date = latest_row.get("end", "")
                 
-    if not all_valid_rows:
-        return 0.0
-        
-    all_valid_rows.sort(key=lambda x: x.get("end", ""))
-    max_year = int(all_valid_rows[-1].get("end", "2000")[:4])
-    
-    for concept in concept_list:
-        if concept in concept_rows_map:
-            c_rows = concept_rows_map[concept]
-            c_rows.sort(key=lambda x: x.get("end", ""))
-            c_latest = c_rows[-1]
-            c_year = int(c_latest.get("end", "2000")[:4])
-            
-            if c_year >= max_year:
-                return float(c_latest.get("val", 0.0))
-                
-    return 0.0
+                if end_date > best_date:
+                    best_date = end_date
+                    best_val = float(latest_row.get("val", 0.0))
+                    
+    return best_val
 
 def extract_dynamic_growth_rate(facts_tree):
     concepts = [
@@ -108,45 +96,37 @@ def extract_dynamic_growth_rate(facts_tree):
         "SalesRevenueNet",
         "RevenueFromContractWithCustomerIncludingAssessedTax"
     ]
+    best_date = ""
+    best_fy_rows = []
+    
     if "facts" not in facts_tree or "us-gaap" not in facts_tree["facts"]:
         return 0.10
         
-    all_valid_rows = []
     for concept in concepts:
         if concept in facts_tree["facts"]["us-gaap"]:
-            units = facts_tree["facts"]["us-gaap"][concept].get("units", {})
-            rows = units.get("USD", [])
-            valid_rows = [r for r in rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+            units = facts_tree["facts"]["us-gaap"][concept].get("units", {}).get("USD", [])
+            valid_rows = [r for r in units if "frame" in r and len(r["frame"]) == 6]
+            if not valid_rows:
+                valid_rows = [r for r in units if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+                
             if valid_rows:
-                all_valid_rows.extend(valid_rows)
-            
-    if not all_valid_rows:
-        return 0.10
-        
-    all_valid_rows.sort(key=lambda x: x.get("end", ""))
-    max_year = int(all_valid_rows[-1].get("end", "2000")[:4])
-    
-    for concept in concepts:
-        if concept in facts_tree["facts"]["us-gaap"]:
-            units = facts_tree["facts"]["us-gaap"][concept].get("units", {})
-            rows = units.get("USD", [])
-            valid_rows = [r for r in rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
-            
-            year_vals = {}
-            for r in valid_rows:
-                y = int(str(r.get("end", "2000"))[:4])
-                year_vals[y] = float(r.get("val", 0.0))
-                
-            if not year_vals:
-                continue
-                
-            sorted_years = sorted(list(year_vals.keys()))
-            if len(sorted_years) >= 2 and sorted_years[-1] >= max_year:
-                v_latest = year_vals[sorted_years[-1]]
-                v_prev = year_vals[sorted_years[-2]]
-                if v_prev > 0 and v_latest > 0:
-                    g = (v_latest - v_prev) / v_prev
-                    return float(max(0.03, min(g, 0.22)))
+                valid_rows.sort(key=lambda x: x.get("end", ""))
+                end_date = valid_rows[-1].get("end", "")
+                if end_date > best_date:
+                    best_date = end_date
+                    best_fy_rows = valid_rows
+                    
+    if len(best_fy_rows) >= 2:
+        unique_periods = {}
+        for r in best_fy_rows:
+            unique_periods[r.get("end", "")] = float(r.get("val", 0.0))
+        sorted_dates = sorted(list(unique_periods.keys()))
+        if len(sorted_dates) >= 2:
+            v_latest = unique_periods[sorted_dates[-1]]
+            v_prev = unique_periods[sorted_dates[-2]]
+            if v_prev > 0 and v_latest > 0:
+                g = (v_latest - v_prev) / v_prev
+                return float(max(0.03, min(g, 0.22)))
     return 0.10
 
 def fetch_sec_data(symbol):
@@ -170,8 +150,8 @@ def fetch_sec_data(symbol):
     ])
     
     G_val = get_xbrl_annual_val(facts, [
-        "ShareBasedCompensation", 
         "AllocatedShareBasedCompensationExpense", 
+        "ShareBasedCompensation", 
         "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense",
         "ShareBasedCompensationArrangementsByShareBasedPaymentAwardCompensationExpense"
     ])
@@ -179,20 +159,22 @@ def fetch_sec_data(symbol):
     T_val = get_xbrl_annual_val(facts, [
         "PaymentsForRepurchaseOfCommonStock", 
         "PaymentsForRepurchaseOfEquity", 
-        "PaymentsRelatedToTaxWithholdingForShareBasedCompensation"
+        "PaymentsRelatedToTaxWithholdingForShareBasedCompensation",
+        "PaymentsForRepurchaseOfOtherEquity"
     ])
 
     # 2. Strict Balance Sheet Liquid Assets
     cash_val = get_xbrl_instant_val(facts, [
         "CashAndCashEquivalentsAtCarryingValue", 
-        "CashAndDueFromBanks",
-        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        "CashAndDueFromBanks"
     ])
     
     st_inv_val = get_xbrl_instant_val(facts, [
         "MarketableSecuritiesCurrent", 
         "AvailableForSaleSecuritiesCurrent",
-        "ShortTermInvestments"
+        "ShortTermInvestments",
+        "MarketableSecurities"
     ])
 
     # 3. Total Funded Debt
@@ -206,11 +188,11 @@ def fetch_sec_data(symbol):
     ])
     
     st_debt = get_xbrl_instant_val(facts, [
-        "LongTermDebtCurrent",
         "DebtCurrent", 
-        "NotesPayableAndOtherBorrowingsCurrent",
         "ShortTermBorrowings", 
         "CommercialPaper",
+        "LongTermDebtCurrent",
+        "NotesPayableAndOtherBorrowingsCurrent",
         "LinesOfCreditCurrent",
         "NotesPayableCurrent"
     ])
@@ -252,7 +234,7 @@ def fetch_sec_data(symbol):
 
 # Search Bar
 ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ORCL, AAPL, MSFT, GOOGL, AMZN").upper().strip()
-tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=2)
+tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=3)
 tier = AICT_TIERS[tier_name]
 
 if st.button("Evaluate Stock", type="primary"):
