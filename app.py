@@ -36,7 +36,7 @@ import streamlit as st
 
 SEC_HEADERS = {
     # SEC requires a real contact address. Put your own in before deploying.
-    "User-Agent": "IV15 Research Tool contact@example.com",
+    "User-Agent": "IV15 Research Tool chenfind@hotmail.com",
     "Accept-Encoding": "gzip, deflate",
 }
 
