@@ -89,53 +89,48 @@ def fetch_sec_data(symbol):
     
     facts = res.json()
 
-    # 1. Income & SBC
+    # 1. Audited Income Statement & SBC
     N_val = get_xbrl_annual_val(facts, [
         "NetIncomeLoss", 
         "NetIncomeLossAvailableToCommonStockholdersBasic", 
-        "ProfitLoss",
-        "NetIncomeLossAllocatedToGeneralPartners",
-        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"
+        "ProfitLoss"
     ])
     G_val = get_xbrl_annual_val(facts, [
         "AllocatedShareBasedCompensationExpense", 
         "ShareBasedCompensation", 
-        "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense",
-        "ShareBasedCompensationArrangementsByShareBasedPaymentAwardCompensationExpense"
+        "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense"
     ])
     T_val = get_xbrl_annual_val(facts, [
         "PaymentsForRepurchaseOfCommonStock", 
         "PaymentsForRepurchaseOfEquity", 
-        "PaymentsRelatedToTaxWithholdingForShareBasedCompensation",
-        "PaymentsForRepurchaseOfOtherEquity"
+        "PaymentsRelatedToTaxWithholdingForShareBasedCompensation"
     ])
 
-    # 2. Strict Balance Sheet Cash (Cash & Pure Marketable Securities only)
+    # 2. Strict Balance Sheet Liquid Assets
     cash_val = get_xbrl_instant_val(facts, [
         "CashAndCashEquivalentsAtCarryingValue", 
         "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"
     ])
     st_inv_val = get_xbrl_instant_val(facts, [
         "MarketableSecuritiesCurrent", 
-        "AvailableForSaleSecuritiesCurrent"
+        "AvailableForSaleSecuritiesCurrent",
+        "MarketableSecurities"
     ])
 
-    # 3. Funded Corporate Debt (Strict Senior Notes, Bonds, Credit Facilities)
+    # 3. Total Funded Debt (Includes Oracle's NotesPayable tags)
     lt_debt = get_xbrl_instant_val(facts, [
+        "NotesPayableAndOtherBorrowingsNoncurrent",
         "LongTermDebtNoncurrent", 
         "LongTermDebtAndCapitalLeaseObligations", 
         "SeniorNotes",
-        "LongTermDebt",
-        "ConvertibleDebtNoncurrent",
-        "NotesPayableNoncurrent"
+        "LongTermDebt"
     ])
     st_debt = get_xbrl_instant_val(facts, [
+        "NotesPayableAndOtherBorrowingsCurrent",
         "DebtCurrent", 
         "ShortTermBorrowings", 
         "CommercialPaper",
-        "LongTermDebtCurrent",
-        "LinesOfCreditCurrent",
-        "NotesPayableCurrent"
+        "LongTermDebtCurrent"
     ])
     total_debt_val = lt_debt + st_debt
 
@@ -174,8 +169,8 @@ def fetch_sec_data(symbol):
     }
 
 # Search Bar
-ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ORCL, ADBE, NOW, CRM, GOOGL, CRDO").upper().strip()
-tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=2)
+ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ORCL, ADBE, NOW, CRM, GOOGL").upper().strip()
+tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=3)
 tier = AICT_TIERS[tier_name]
 
 if st.button("Evaluate Stock", type="primary"):
