@@ -29,46 +29,55 @@ def get_sec_ticker_mapping():
     data = res.json()
     return {entry["ticker"].upper(): str(entry["cik_str"]).zfill(10) for entry in data.values()}
 
+# --- REWRITTEN BULLETPROOF SEC EXTRACTION ---
 def get_xbrl_annual_val(facts_tree, concept_list, taxonomy="us-gaap"):
     if "facts" not in facts_tree or taxonomy not in facts_tree["facts"]:
         return 0.0
+    all_rows = []
+    # Aggregate all concepts before deciding
     for concept in concept_list:
         if concept in facts_tree["facts"][taxonomy]:
-            units_dict = facts_tree["facts"][taxonomy][concept].get("units", {})
-            rows = units_dict.get("USD", units_dict.get("shares", []))
+            units = facts_tree["facts"][taxonomy][concept].get("units", {})
+            rows = units.get("USD", units.get("shares", []))
+            all_rows.extend(rows)
             
-            # Gold Standard: Extract only SEC authoritative consolidated "frames" (e.g. CY2023)
-            frame_rows = [r for r in rows if "frame" in r and len(r["frame"]) == 6]
-            if frame_rows:
-                frame_rows.sort(key=lambda x: x.get("end", ""))
-                return float(frame_rows[-1].get("val", 0.0))
-            
-            # Fallback: strict 10-K extraction
-            fy_rows = [r for r in rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
-            if fy_rows:
-                fy_rows.sort(key=lambda x: x.get("end", ""))
-                return float(fy_rows[-1].get("val", 0.0))
+    if not all_rows:
+        return 0.0
+        
+    frame_rows = [r for r in all_rows if "frame" in r and len(r["frame"]) == 6]
+    if frame_rows:
+        frame_rows.sort(key=lambda x: x.get("end", ""))
+        return float(frame_rows[-1].get("val", 0.0))
+        
+    fy_rows = [r for r in all_rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+    if fy_rows:
+        fy_rows.sort(key=lambda x: x.get("end", ""))
+        return float(fy_rows[-1].get("val", 0.0))
     return 0.0
 
 def get_xbrl_instant_val(facts_tree, concept_list, taxonomy="us-gaap"):
     if "facts" not in facts_tree or taxonomy not in facts_tree["facts"]:
         return 0.0
+    all_rows = []
+    # Aggregate all concepts before deciding
     for concept in concept_list:
         if concept in facts_tree["facts"][taxonomy]:
-            units_dict = facts_tree["facts"][taxonomy][concept].get("units", {})
-            rows = units_dict.get("USD", units_dict.get("shares", []))
+            units = facts_tree["facts"][taxonomy][concept].get("units", {})
+            rows = units.get("USD", units.get("shares", []))
+            all_rows.extend(rows)
             
-            # Gold Standard: Extract only SEC authoritative consolidated instant "frames" (e.g. CY2023Q4I)
-            frame_rows = [r for r in rows if "frame" in r and r["frame"].endswith("I")]
-            if frame_rows:
-                frame_rows.sort(key=lambda x: x.get("end", ""))
-                return float(frame_rows[-1].get("val", 0.0))
-            
-            # Fallback: strictly filter out 8-Ks and segment dumps
-            valid_rows = [r for r in rows if r.get("form") in ["10-K", "10-Q"]]
-            if valid_rows:
-                valid_rows.sort(key=lambda x: (x.get("end", ""), x.get("filed", "")))
-                return float(valid_rows[-1].get("val", 0.0))
+    if not all_rows:
+        return 0.0
+        
+    frame_rows = [r for r in all_rows if "frame" in r and r["frame"].endswith("I")]
+    if frame_rows:
+        frame_rows.sort(key=lambda x: x.get("end", ""))
+        return float(frame_rows[-1].get("val", 0.0))
+        
+    valid_rows = [r for r in all_rows if r.get("form") in ["10-K", "10-Q"]]
+    if valid_rows:
+        valid_rows.sort(key=lambda x: (x.get("end", ""), x.get("filed", "")))
+        return float(valid_rows[-1].get("val", 0.0))
     return 0.0
 
 def extract_dynamic_growth_rate(facts_tree):
@@ -78,19 +87,28 @@ def extract_dynamic_growth_rate(facts_tree):
         "SalesRevenueNet",
         "RevenueFromContractWithCustomerIncludingAssessedTax"
     ]
+    all_rows = []
     if "facts" in facts_tree and "us-gaap" in facts_tree["facts"]:
         us_facts = facts_tree["facts"]["us-gaap"]
         for concept in concepts:
             if concept in us_facts:
                 units = us_facts[concept].get("units", {}).get("USD", [])
-                fy_rows = [r for r in units if "frame" in r and len(r["frame"]) == 6]
-                if not fy_rows:
-                    fy_rows = [r for r in units if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+                all_rows.extend(units)
                 
-                if len(fy_rows) >= 2:
-                    fy_rows.sort(key=lambda x: x.get("end", ""))
-                    v_latest = float(fy_rows[-1].get("val", 0.0))
-                    v_prev = float(fy_rows[-2].get("val", 0.0))
+        if all_rows:
+            fy_rows = [r for r in all_rows if "frame" in r and len(r["frame"]) == 6]
+            if not fy_rows:
+                fy_rows = [r for r in all_rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+            
+            if fy_rows:
+                unique_periods = {}
+                for r in fy_rows:
+                    unique_periods[r.get("end", "")] = float(r.get("val", 0.0))
+                
+                sorted_dates = sorted(list(unique_periods.keys()))
+                if len(sorted_dates) >= 2:
+                    v_latest = unique_periods[sorted_dates[-1]]
+                    v_prev = unique_periods[sorted_dates[-2]]
                     if v_prev > 0 and v_latest > 0:
                         g = (v_latest - v_prev) / v_prev
                         return float(max(0.03, min(g, 0.22)))
