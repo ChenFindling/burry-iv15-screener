@@ -29,72 +29,79 @@ def get_sec_ticker_mapping():
     data = res.json()
     return {entry["ticker"].upper(): str(entry["cik_str"]).zfill(10) for entry in data.values()}
 
-def get_latest_report_year(facts_tree):
-    """Safely extracts the most recent fiscal year the company has filed a 10-K."""
-    latest_year = 2020
-    try:
-        for tag in ["NetIncomeLoss", "Assets", "Liabilities", "CommonStockSharesOutstanding"]:
-            if tag in facts_tree.get("facts", {}).get("us-gaap", {}):
-                units = facts_tree["facts"]["us-gaap"][tag].get("units", {})
-                for rows in units.values():
-                    for r in rows:
-                        if r.get("form") == "10-K":
-                            y = int(str(r.get("end", "2000"))[:4])
-                            if y > latest_year:
-                                latest_year = y
-    except Exception:
-        pass
-    return latest_year
-
-# --- REWRITTEN PRIORITY CASCADE EXTRACTORS ---
-def get_xbrl_annual_val(facts_tree, concept_list, latest_year, taxonomy="us-gaap"):
+# --- REWRITTEN BUCKET-LEVEL SYNCHRONIZATION EXTRACTORS ---
+def get_xbrl_annual_val(facts_tree, concept_list, taxonomy="us-gaap"):
     if "facts" not in facts_tree or taxonomy not in facts_tree["facts"]:
         return 0.0
+        
+    all_valid_rows = []
+    concept_rows_map = {}
     
     for concept in concept_list:
         if concept in facts_tree["facts"][taxonomy]:
             units = facts_tree["facts"][taxonomy][concept].get("units", {})
             rows = units.get("USD", units.get("shares", []))
             
-            # Filter for official 10-K filings
             valid_rows = [r for r in rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
-            if not valid_rows:
-                continue
+            if valid_rows:
+                all_valid_rows.extend(valid_rows)
+                concept_rows_map[concept] = valid_rows
                 
-            # Sort chronologically
-            valid_rows.sort(key=lambda x: x.get("end", ""))
-            latest_row = valid_rows[-1]
-            row_year = int(str(latest_row.get("end", "2000"))[:4])
+    if not all_valid_rows:
+        return 0.0
+        
+    all_valid_rows.sort(key=lambda x: x.get("end", ""))
+    max_year = int(all_valid_rows[-1].get("end", "2000")[:4])
+    
+    for concept in concept_list:
+        if concept in concept_rows_map:
+            c_rows = concept_rows_map[concept]
+            c_rows.sort(key=lambda x: x.get("end", ""))
+            c_latest = c_rows[-1]
+            c_year = int(c_latest.get("end", "2000")[:4])
             
-            # Lock in value if it is not stale (within 2 years of the company's latest filing)
-            if row_year >= latest_year - 2:
-                return float(latest_row.get("val", 0.0))
+            # Strict synchronization: Tag is only valid if it matches the bucket's latest year
+            if c_year >= max_year:
+                return float(c_latest.get("val", 0.0))
                 
     return 0.0
 
-def get_xbrl_instant_val(facts_tree, concept_list, latest_year, taxonomy="us-gaap"):
+def get_xbrl_instant_val(facts_tree, concept_list, taxonomy="us-gaap"):
     if "facts" not in facts_tree or taxonomy not in facts_tree["facts"]:
         return 0.0
         
+    all_valid_rows = []
+    concept_rows_map = {}
+    
     for concept in concept_list:
         if concept in facts_tree["facts"][taxonomy]:
             units = facts_tree["facts"][taxonomy][concept].get("units", {})
             rows = units.get("USD", units.get("shares", []))
             
             valid_rows = [r for r in rows if r.get("form") in ["10-K", "10-Q", "10-K/A", "10-Q/A"]]
-            if not valid_rows:
-                continue
+            if valid_rows:
+                all_valid_rows.extend(valid_rows)
+                concept_rows_map[concept] = valid_rows
                 
-            valid_rows.sort(key=lambda x: x.get("end", ""))
-            latest_row = valid_rows[-1]
-            row_year = int(str(latest_row.get("end", "2000"))[:4])
+    if not all_valid_rows:
+        return 0.0
+        
+    all_valid_rows.sort(key=lambda x: x.get("end", ""))
+    max_year = int(all_valid_rows[-1].get("end", "2000")[:4])
+    
+    for concept in concept_list:
+        if concept in concept_rows_map:
+            c_rows = concept_rows_map[concept]
+            c_rows.sort(key=lambda x: x.get("end", ""))
+            c_latest = c_rows[-1]
+            c_year = int(c_latest.get("end", "2000")[:4])
             
-            if row_year >= latest_year - 2:
-                return float(latest_row.get("val", 0.0))
+            if c_year >= max_year:
+                return float(c_latest.get("val", 0.0))
                 
     return 0.0
 
-def extract_dynamic_growth_rate(facts_tree, latest_year):
+def extract_dynamic_growth_rate(facts_tree):
     concepts = [
         "RevenueFromContractWithCustomerExcludingAssessedTax",
         "Revenues",
@@ -104,26 +111,37 @@ def extract_dynamic_growth_rate(facts_tree, latest_year):
     if "facts" not in facts_tree or "us-gaap" not in facts_tree["facts"]:
         return 0.10
         
+    all_valid_rows = []
     for concept in concepts:
         if concept in facts_tree["facts"]["us-gaap"]:
             units = facts_tree["facts"]["us-gaap"][concept].get("units", {})
             rows = units.get("USD", [])
-            
             valid_rows = [r for r in rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
-            if not valid_rows:
-                continue
-                
+            if valid_rows:
+                all_valid_rows.extend(valid_rows)
+            
+    if not all_valid_rows:
+        return 0.10
+        
+    all_valid_rows.sort(key=lambda x: x.get("end", ""))
+    max_year = int(all_valid_rows[-1].get("end", "2000")[:4])
+    
+    for concept in concepts:
+        if concept in facts_tree["facts"]["us-gaap"]:
+            units = facts_tree["facts"]["us-gaap"][concept].get("units", {})
+            rows = units.get("USD", [])
+            valid_rows = [r for r in rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+            
             year_vals = {}
             for r in valid_rows:
-                year_str = str(r.get("end", ""))[:4]
-                if year_str.isdigit():
-                    year_vals[int(year_str)] = float(r.get("val", 0.0))
-                    
+                y = int(str(r.get("end", "2000"))[:4])
+                year_vals[y] = float(r.get("val", 0.0))
+                
             if not year_vals:
                 continue
                 
             sorted_years = sorted(list(year_vals.keys()))
-            if len(sorted_years) >= 2 and sorted_years[-1] >= latest_year - 2:
+            if len(sorted_years) >= 2 and sorted_years[-1] >= max_year:
                 v_latest = year_vals[sorted_years[-1]]
                 v_prev = year_vals[sorted_years[-2]]
                 if v_prev > 0 and v_latest > 0:
@@ -143,42 +161,41 @@ def fetch_sec_data(symbol):
         raise ConnectionError(f"SEC API returned status code {res.status_code}")
     
     facts = res.json()
-    latest_year = get_latest_report_year(facts)
 
     # 1. Audited Income Statement & SBC
     N_val = get_xbrl_annual_val(facts, [
         "NetIncomeLoss", 
         "NetIncomeLossAvailableToCommonStockholdersBasic", 
         "ProfitLoss"
-    ], latest_year)
+    ])
     
     G_val = get_xbrl_annual_val(facts, [
         "ShareBasedCompensation", 
         "AllocatedShareBasedCompensationExpense", 
         "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense",
         "ShareBasedCompensationArrangementsByShareBasedPaymentAwardCompensationExpense"
-    ], latest_year)
+    ])
     
     T_val = get_xbrl_annual_val(facts, [
         "PaymentsForRepurchaseOfCommonStock", 
         "PaymentsForRepurchaseOfEquity", 
         "PaymentsRelatedToTaxWithholdingForShareBasedCompensation"
-    ], latest_year)
+    ])
 
     # 2. Strict Balance Sheet Liquid Assets
     cash_val = get_xbrl_instant_val(facts, [
         "CashAndCashEquivalentsAtCarryingValue", 
         "CashAndDueFromBanks",
         "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"
-    ], latest_year)
+    ])
     
     st_inv_val = get_xbrl_instant_val(facts, [
         "MarketableSecuritiesCurrent", 
         "AvailableForSaleSecuritiesCurrent",
         "ShortTermInvestments"
-    ], latest_year)
+    ])
 
-    # 3. Total Funded Debt (Ordered strictly by institutional priority)
+    # 3. Total Funded Debt
     lt_debt = get_xbrl_instant_val(facts, [
         "LongTermDebtNoncurrent",
         "LongTermDebt",
@@ -186,7 +203,7 @@ def fetch_sec_data(symbol):
         "SeniorNotes",
         "ConvertibleDebtNoncurrent",
         "NotesPayableNoncurrent"
-    ], latest_year)
+    ])
     
     st_debt = get_xbrl_instant_val(facts, [
         "LongTermDebtCurrent",
@@ -196,18 +213,18 @@ def fetch_sec_data(symbol):
         "CommercialPaper",
         "LinesOfCreditCurrent",
         "NotesPayableCurrent"
-    ], latest_year)
+    ])
     total_debt_val = lt_debt + st_debt
 
     # 4. Diluted Share Count
     shares_val = get_xbrl_annual_val(facts, [
         "WeightedAverageNumberOfDilutedSharesOutstanding", 
         "WeightedAverageNumberOfSharesOutstandingDiluted"
-    ], latest_year)
+    ])
     if shares_val == 0.0:
-        shares_val = get_xbrl_instant_val(facts, ["EntityCommonStockSharesOutstanding"], latest_year, taxonomy="dei")
+        shares_val = get_xbrl_instant_val(facts, ["EntityCommonStockSharesOutstanding"], taxonomy="dei")
     if shares_val == 0.0:
-        shares_val = get_xbrl_instant_val(facts, ["CommonStockSharesOutstanding"], latest_year)
+        shares_val = get_xbrl_instant_val(facts, ["CommonStockSharesOutstanding"])
 
     # 5. Live Market Price via quote stream
     price_val = 100.0
@@ -219,7 +236,7 @@ def fetch_sec_data(symbol):
     except Exception:
         pass
 
-    g1_val = extract_dynamic_growth_rate(facts, latest_year)
+    g1_val = extract_dynamic_growth_rate(facts)
 
     return {
         "ticker": symbol,
