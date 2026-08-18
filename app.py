@@ -29,7 +29,7 @@ def get_sec_ticker_mapping():
     data = res.json()
     return {entry["ticker"].upper(): str(entry["cik_str"]).zfill(10) for entry in data.values()}
 
-# --- THE FIX: STRICT CONSOLIDATED SEGMENT FILTER & DATE SUPERIORITY ---
+# --- REWRITTEN DATE SUPERIORITY EXTRACTORS ---
 def get_xbrl_annual_val(facts_tree, concept_list, taxonomy="us-gaap"):
     if "facts" not in facts_tree or taxonomy not in facts_tree["facts"]:
         return 0.0
@@ -42,14 +42,17 @@ def get_xbrl_annual_val(facts_tree, concept_list, taxonomy="us-gaap"):
             units = facts_tree["facts"][taxonomy][concept].get("units", {})
             rows = units.get("USD", units.get("shares", []))
             
-            # CRITICAL: "segment" not in r filters out subsidiary/parent-only data
-            valid_rows = [r for r in rows if "segment" not in r and r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+            # Combine sources but exclude segment anomalies
+            valid_rows = [r for r in rows if "segment" not in r and 
+                          (("frame" in r and len(r["frame"]) == 6) or 
+                           (r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]))]
             
             if valid_rows:
-                valid_rows.sort(key=lambda x: x.get("end", ""))
+                valid_rows.sort(key=lambda x: (x.get("end", ""), x.get("filed", "")))
                 latest_row = valid_rows[-1]
                 end_date = latest_row.get("end", "")
                 
+                # Strict superiority keeps the highest priority concept if dates match
                 if end_date > best_date:
                     best_date = end_date
                     best_val = float(latest_row.get("val", 0.0))
@@ -68,11 +71,12 @@ def get_xbrl_instant_val(facts_tree, concept_list, taxonomy="us-gaap"):
             units = facts_tree["facts"][taxonomy][concept].get("units", {})
             rows = units.get("USD", units.get("shares", []))
             
-            # CRITICAL: "segment" not in r
-            valid_rows = [r for r in rows if "segment" not in r and r.get("form") in ["10-K", "10-Q", "10-K/A", "10-Q/A"]]
+            valid_rows = [r for r in rows if "segment" not in r and 
+                          (("frame" in r and r["frame"].endswith("I")) or 
+                           (r.get("form") in ["10-K", "10-Q", "10-K/A", "10-Q/A"]))]
             
             if valid_rows:
-                valid_rows.sort(key=lambda x: x.get("end", ""))
+                valid_rows.sort(key=lambda x: (x.get("end", ""), x.get("filed", "")))
                 latest_row = valid_rows[-1]
                 end_date = latest_row.get("end", "")
                 
@@ -89,27 +93,37 @@ def extract_dynamic_growth_rate(facts_tree):
         "SalesRevenueNet",
         "RevenueFromContractWithCustomerIncludingAssessedTax"
     ]
+    best_date = ""
+    best_fy_rows = []
+    
     if "facts" not in facts_tree or "us-gaap" not in facts_tree["facts"]:
         return 0.10
         
     for concept in concepts:
         if concept in facts_tree["facts"]["us-gaap"]:
-            units = facts_tree["facts"]["us-gaap"][concept].get("units", {})
-            rows = units.get("USD", [])
-            
-            valid_rows = [r for r in rows if "segment" not in r and r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+            units = facts_tree["facts"]["us-gaap"][concept].get("units", {}).get("USD", [])
+            valid_rows = [r for r in units if "segment" not in r and 
+                          (("frame" in r and len(r["frame"]) == 6) or 
+                           (r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]))]
             
             if valid_rows:
-                unique_periods = {}
-                for r in valid_rows:
-                    unique_periods[r.get("end", "")] = float(r.get("val", 0.0))
-                sorted_dates = sorted(list(unique_periods.keys()))
-                if len(sorted_dates) >= 2:
-                    v_latest = unique_periods[sorted_dates[-1]]
-                    v_prev = unique_periods[sorted_dates[-2]]
-                    if v_prev > 0 and v_latest > 0:
-                        g = (v_latest - v_prev) / v_prev
-                        return float(max(0.03, min(g, 0.22)))
+                valid_rows.sort(key=lambda x: (x.get("end", ""), x.get("filed", "")))
+                end_date = valid_rows[-1].get("end", "")
+                if end_date > best_date:
+                    best_date = end_date
+                    best_fy_rows = valid_rows
+                    
+    if len(best_fy_rows) >= 2:
+        unique_periods = {}
+        for r in best_fy_rows:
+            unique_periods[r.get("end", "")] = float(r.get("val", 0.0))
+        sorted_dates = sorted(list(unique_periods.keys()))
+        if len(sorted_dates) >= 2:
+            v_latest = unique_periods[sorted_dates[-1]]
+            v_prev = unique_periods[sorted_dates[-2]]
+            if v_prev > 0 and v_latest > 0:
+                g = (v_latest - v_prev) / v_prev
+                return float(max(0.03, min(g, 0.22)))
     return 0.10
 
 def fetch_sec_data(symbol):
@@ -133,8 +147,8 @@ def fetch_sec_data(symbol):
     ])
     
     G_val = get_xbrl_annual_val(facts, [
-        "ShareBasedCompensation", 
         "AllocatedShareBasedCompensationExpense", 
+        "ShareBasedCompensation", 
         "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense",
         "ShareBasedCompensationArrangementsByShareBasedPaymentAwardCompensationExpense"
     ])
