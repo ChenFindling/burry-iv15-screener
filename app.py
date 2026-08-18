@@ -159,6 +159,17 @@ class Pooled:
         return self.dE * (1.0 + gaap_growth) - 1.0
 
 
+def pool_recent(years: list[Year], n: int = 3) -> Pooled:
+    """Pooled dE over just the last n years.
+
+    The long window is the honest diagnostic, but where capital policy has
+    changed the recent regime is what should feed a forward estimate.
+    Salesforce is the clear case: 54.7% pooled over eleven years, 90.4% over
+    the last three once buybacks overwhelmed issuance.
+    """
+    return pool(years[-n:])
+
+
 def pool(years: list[Year]) -> Pooled:
     sN = sum(y.N for y in years)
     if not years or sN == 0:
@@ -501,160 +512,221 @@ def self_test() -> list[tuple[str, bool, str]]:
 #  UI
 # ══════════════════════════════════════════════════════════════════════
 
-st.set_page_config(page_title="Burry IV15 Screener", layout="wide")
-st.title("Burry IV15 Screener")
-st.caption("True owners' earnings after stock compensation, then the price ladder that follows")
+st.set_page_config(page_title="Burry IV15 Screener", layout="centered")
+
+st.title("🎯 Burry IV15 Value Screener")
+st.caption("Michael Burry's True Owners' Earnings (OE) & AICT Moat Valuation Engine")
 
 with st.sidebar:
     st.subheader("Method self-test")
-    st.caption("Checks the maths against Burry's own published figures.")
+    st.caption("Checks the engine against Burry's own published figures.")
     if st.button("Run self-test"):
         for name, ok, got in self_test():
             st.write(("✅ " if ok else "❌ ") + f"{name} — {got}")
     st.divider()
-    st.caption("IV15 is the price giving about 15% a year over 15+ years. It is a buy "
-               "price target from a multi-stage cash flow model, not an earnings multiple. "
-               "Real intrinsic value sits between IV8 and IV10.")
+    st.caption("IV15 is the price giving about 15% a year over 15+ years. It is a buy price "
+               "target from a multi-stage cash flow model, not an earnings multiple. Real "
+               "intrinsic value sits between IV8 and IV10 — below that, buybacks add value "
+               "per share; above it they quietly destroy it.")
 
-c1, c2, c3 = st.columns([2, 1, 1])
-ticker = c1.text_input("Ticker", placeholder="ADBE, CRM, NOW, GOOGL…").upper().strip()
-n_years = c2.number_input("Years of history", 3, 12, 10)
-go = c3.button("Analyse", type="primary", use_container_width=True)
+ticker = st.text_input("Enter Stock Ticker", value="",
+                       placeholder="e.g. ADBE, NOW, CRM, GOOGL, PAYC").upper().strip()
+tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT), index=2,
+                         format_func=lambda t: f"{t} — {TIER_BLURB[t]}")
 
-if go and ticker:
-    try:
-        with st.spinner(f"Reading {ticker} annual filings…"):
-            years, notes, pre = load(ticker, int(n_years))
-        st.session_state.update(years=years, notes=notes, pre=pre, tk=ticker)
-    except Exception as e:
-        st.error(str(e))
+if st.button("Evaluate Stock", type="primary"):
+    if not ticker:
+        st.warning("Please enter a stock ticker symbol first.")
+    else:
+        try:
+            with st.spinner(f"Pulling SEC EDGAR audited 10-K data for {ticker}..."):
+                yrs, notes, pre = load(ticker, 10)
+            st.session_state.update(years=yrs, notes=notes, pre=pre, tk=ticker)
+        except Exception as e:
+            st.error(f"Error fetching SEC data: {e}")
 
 years = st.session_state.get("years", [])
-if years:
+if years and ticker and st.session_state.get("tk") == ticker:
     notes, pre, tk = st.session_state["notes"], st.session_state["pre"], st.session_state["tk"]
+    pooled = pool(years)
 
-    # ── owners' earnings ────────────────────────────────────────────
-    st.divider()
-    st.subheader(f"Owners' earnings — {tk}")
+    # ── 1. adjustments ──────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("⚙️ Audited SEC Financials & Adjustments")
+
+    recent = pool_recent(years, 3) if len(years) >= 3 else pooled
+    regime_gap = abs(recent.dE - pooled.dE)
+
+    f1, f2, f3 = st.columns(3)
+    fwd_N = f1.number_input("Forward GAAP Net Income ($M)",
+                            value=float(round(years[-1].N, 1)), step=10.0,
+                            help="Next year's expected GAAP net income — analyst consensus or "
+                                 "your own estimate. Burry values on forward owners' earnings, "
+                                 "not trailing.")
+    which = f2.radio("Apply ΔE from",
+                     [f"Last 3 years ({recent.dE:.1%})", f"Full period ({pooled.dE:.1%})"],
+                     help="The long window is the diagnostic. Where capital policy has changed, "
+                          "the recent regime is what will actually apply going forward.")
+    use_dE = recent.dE if which.startswith("Last 3") else pooled.dE
+    derived_OE = fwd_N * use_dE
+    f3.metric("Implied Forward OE", f"${derived_OE:,.0f}M",
+              f"{fwd_N:,.0f} x {use_dE:.1%}")
+
+    if regime_gap > 0.15:
+        st.warning(f"⚠️ **Regime change:** ΔE was {pooled.dE:.1%} over {pooled.years} years but "
+                   f"{recent.dE:.1%} over the last three. Capital policy has shifted materially. "
+                   "The recent figure is the fairer basis for a forward estimate — but satisfy "
+                   "yourself the change is durable, not one good year.")
+
+    a1, a2, a3 = st.columns(3)
+    with a1:
+        OE = st.number_input("Base Owners' Earnings ($M)",
+                             value=float(round(derived_OE, 1)), step=1.0,
+                             help="Seeded from forward net income x ΔE. Adjust further for "
+                                  "maintenance capex, working capital and one-offs.")
+        growth = st.number_input("Stage 1 Growth Rate (%)",
+                                 value=round(pre["growth"] * 100, 1), step=0.5,
+                                 help="Seeded from 3-year revenue growth. Return on capital "
+                                      "is the ceiling — nothing outgrows it forever.") / 100
+    with a2:
+        shares = st.number_input("Diluted Shares (M)",
+                                 value=float(round(pre["shares"], 1)), step=1.0)
+        exit_m = st.number_input("Exit Multiple (M15)", value=20.0, step=0.5,
+                                 help="Multiple applied to year-15 owners' earnings. Burry has "
+                                      "never published these — your judgement.")
+    with a3:
+        net_cash = st.number_input("Net Cash ($M)",
+                                   value=float(round(pre["net_cash"], 1)), step=10.0)
+        blend = st.slider("Model Blend (long-horizon weight)", 0.0, 1.0, 0.5, 0.05,
+                          help="IV15 blends a long-horizon perpetuity model with an exit-multiple "
+                               "model. The ratio depends on confidence in each and is not "
+                               "published. This moves the answer a lot — on CRM, roughly $10.")
+
     for nte in notes:
-        st.info(nte)
+        st.caption("ℹ️ " + nte)
 
-    df = pd.DataFrame([{"FY": y.fy, "Net income": y.N, "SBC expense": y.G, "Buybacks": y.T,
-                        "Share change": y.dS, "Avg price": y.price, "True SBC cost": y.omega,
-                        "Owners' earnings": y.OE, "Kept": y.dE} for y in years])
-    st.dataframe(df.style.format({
-        "Net income": "{:,.0f}", "SBC expense": "{:,.0f}", "Buybacks": "{:,.0f}",
-        "Share change": "{:+,.1f}", "Avg price": "${:,.2f}", "True SBC cost": "{:,.0f}",
-        "Owners' earnings": "{:,.0f}", "Kept": "{:.1%}"}, na_rep="—"),
-        use_container_width=True, hide_index=True)
+    # ── 2. tragic algebra ───────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🐹 Tragic Algebra Diagnostic")
 
-    p = pool(years)
-    m = st.columns(4)
-    m[0].metric("Owners' earnings kept", f"{p.dE:.1%}", f"{p.years}y pooled")
-    m[1].metric("Cumulative owners' earnings", f"${p.sum_OE:,.0f}M")
-    m[2].metric("GAAP overstates by", f"{p.gaap_overstatement:.1%}")
-    m[3].metric("Wall Street overstates by", f"{p.street_overstatement:.1%}")
+    d1, d2, d3 = st.columns(3)
+    _rec = pool_recent(years, 3) if len(years) >= 3 else pooled
+    d1.metric("Owners' Earnings Kept (ΔE)", f"{pooled.dE:.1%}",
+              f"{pooled.years}y pooled · last 3y: {_rec.dE:.1%}")
+    d2.metric("True SBC Cost (Ω)", f"${pooled.sum_omega:,.0f}M",
+              f"GAAP SBC: ${pooled.sum_G:,.0f}M")
+    d3.metric("GAAP Overstates By", f"{pooled.gaap_overstatement:.1%}",
+              f"Wall St: {pooled.street_overstatement:.1%}")
 
-    if p.tragic_tier:
-        st.error("**Tragic Tier.** Over this period the cost of stock compensation exceeded "
-                 "everything the business earned. Owners' earnings are negative, and not from "
-                 "one bad year. Shareholders were net funders of employee pay.")
-    elif p.dE < 1 / 1.15:
-        st.warning(f"**Below the 87% break-even.** At {p.dE:.1%}, even 15% reported growth "
-                   f"compounds value per share at only {p.true_cagr(0.15):+.2%} a year. "
-                   f"After ten years just {p.retention(10):.1%} of reported growth survives.")
+    if pooled.tragic_tier:
+        st.error("⚠️ **Tragic Tier:** Over this period the cost of stock compensation exceeded "
+                 "everything the business earned. Owners' earnings are negative, and not from one "
+                 "bad year — shareholders were net funders of employee pay.")
+    elif pooled.dE < 1 / 1.15:
+        st.warning(f"⚠️ **Below the 87% break-even:** at ΔE of {pooled.dE:.1%}, even 15% reported "
+                   f"growth compounds value per share at just {pooled.true_cagr(0.15):+.2%} a year. "
+                   f"After ten years only {pooled.retention(10):.1%} of reported growth survives.")
     else:
-        st.success(f"**Above the 87% break-even** — reported growth actually reaches you. "
-                   f"After ten years {p.retention(10):.1%} of it survives.")
+        st.success(f"✅ **Above the 87% break-even** — reported growth actually reaches you. "
+                   f"After ten years {pooled.retention(10):.1%} of it survives.")
 
-    # ── valuation ───────────────────────────────────────────────────
-    st.divider()
-    st.subheader("Intrinsic value ladder")
+    with st.expander("Year-by-year detail"):
+        st.dataframe(pd.DataFrame([{
+            "FY": y.fy, "Net Income": y.N, "GAAP SBC": y.G, "Buybacks": y.T,
+            "Share Δ": y.dS, "Avg Price": y.price, "Ω": y.omega, "OE": y.OE, "ΔE": y.dE
+        } for y in years]).style.format({
+            "Net Income": "{:,.0f}", "GAAP SBC": "{:,.0f}", "Buybacks": "{:,.0f}",
+            "Share Δ": "{:+,.1f}", "Avg Price": "${:,.2f}", "Ω": "{:,.0f}",
+            "OE": "{:,.0f}", "ΔE": "{:.1%}"}, na_rep="—"),
+            use_container_width=True, hide_index=True)
 
-    v1, v2, v3 = st.columns(3)
-    OE = v1.number_input("Owners' earnings ($M)", value=float(round(years[-1].OE, 1)), step=1.0)
-    shares = v1.number_input("Diluted shares (M)", value=float(round(pre["shares"], 1)), step=1.0)
-    tier = v2.selectbox("Competitive tier", list(AICT), index=2,
-                        format_func=lambda t: f"{t} — {TIER_BLURB[t]}")
-    growth = v2.number_input("Growth rate (%)", value=round(pre["growth"] * 100, 1), step=0.5,
-                             help="Seeded from 3-year revenue growth. Return on capital is the "
-                                  "ceiling — nothing outgrows it forever.") / 100
-    net_cash = v3.number_input("Net cash ($M)", value=float(round(pre["net_cash"], 1)), step=10.0)
-    price = v3.number_input("Price", value=float(current_price(tk) or 100.0), step=0.01)
-
-    with st.expander("Model settings — these are judgement, not published"):
-        h1, h2, h3 = st.columns(3)
-        exit_m = h1.number_input("Exit multiple on year-15 earnings", value=20.0, step=0.5)
-        blend = h2.slider("Weight on long-horizon model", 0.0, 1.0, 0.5, 0.05)
-        s0y = h3.number_input("Hypergrowth years", 0, 8, 0)
-        s0g = h3.number_input("Hypergrowth rate (%)", value=30.0, step=1.0) / 100
-        t = AICT[tier]
-        st.caption(f"{tier}: stage 1 = {t.stage1_years}y, stage 2 = {t.stage2_years}y at "
-                   f"{t.stage2_multiplier:.2f}x, terminal cap {t.terminal_growth_cap:.0%}, debt "
-                   f"capacity {t.debt_capacity_ebitda:.1f}x EBITDA. Total horizon "
-                   f"**{t.horizon + int(s0y)} years**. The exit multiple and blend cannot be "
-                   "recovered from published figures — they are your call.")
-
+    # ── 3. valuation ────────────────────────────────────────────────
     if shares <= 0:
-        st.error("Enter the diluted share count. Everything below divides by it.")
+        st.error("Enter the diluted share count — everything below divides by it.")
         st.stop()
 
-    st.caption(f"Sanity check — implied market cap ${shares * price / 1000:,.1f}B. "
-               "If that is not roughly right, the share count is wrong and so is everything else.")
-
-    par = IVParams(OE=OE, shares=shares, tier=tier, growth=growth, net_cash=net_cash,
-                   exit_multiple=exit_m, blend=blend, stage0_years=int(s0y), stage0_growth=s0g)
+    par = IVParams(OE=OE, shares=shares, tier=tier_name, growth=growth,
+                   net_cash=net_cash, exit_multiple=exit_m, blend=blend)
     lad = ladder(par)
     iv15 = lad[15]
+    price = current_price(tk) or 0.0
+
+    st.markdown("---")
+    st.subheader("🧪 Scenario Stress-Testing Engine")
+    s1, s2 = st.columns(2)
+    keys = list(AICT)
+    worse = s1.selectbox("Stress-Test Moat Downgrade", keys,
+                         index=min(len(keys) - 1, keys.index(tier_name) + 1))
+    cut = s2.slider("Growth Haircut (%)", 0, 80, 30, 5)
+    spar = IVParams(OE=OE, shares=shares, tier=worse, growth=growth * (1 - cut / 100),
+                    net_cash=net_cash, exit_multiple=exit_m, blend=blend)
+    siv = intrinsic_value(spar, 15)
+
+    st.markdown("---")
+    st.subheader(f"📊 Valuation Verdict: {tk}")
+
+    price = st.number_input("Market Price", value=float(price or 100.0), step=0.01)
+    st.caption(f"Implied market cap ${shares * price / 1000:,.1f}B — if that is not roughly "
+               "right, the share count is wrong and so is everything below.")
+
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Market Price", f"${price:,.2f}")
+    if iv15 == iv15 and iv15 > 0:
+        r2.metric("Baseline IV15", f"${iv15:,.2f}", f"P/IV15: {price/iv15:.2f}x")
+    else:
+        r2.metric("Baseline IV15", "negative")
+    if siv == siv and siv > 0:
+        r3.metric("Stressed IV15", f"${siv:,.2f}", f"P/IV15: {price/siv:.2f}x")
+    else:
+        r3.metric("Stressed IV15", "negative")
 
     if iv15 != iv15:
         st.error("Required return must exceed the tier's terminal growth cap.")
     elif iv15 < 0:
-        st.error("**Negative IV15 — not investible.** No share price, not even one cent, "
-                 "delivers 15% a year to a long-term shareholder on these inputs.")
+        st.error(f"⛔ **NOT INVESTIBLE**: no share price — not even $0.01 — delivers 15% a year "
+                 f"to a long-term shareholder in {tk} on these inputs.")
     else:
-        ratio, (zn, kind) = price / iv15, zone(price / iv15)
+        ratio = price / iv15
         er = expected_return(price, par)
-        k = st.columns(4)
-        k[0].metric("IV15", f"${iv15:,.2f}")
-        k[1].metric("Price / IV15", f"{ratio:.2f}x", zn)
-        k[2].metric("Expected return", f"{er:.1%}")
-        k[3].metric("Valuation score", f"{valuation_points(ratio)}/35")
-
-        getattr(st, kind)(
-            f"**{zn}** — at ${price:,.2f} this trades at {ratio:.2f}x its IV15 of "
-            f"${iv15:,.2f}, implying about {er:.1%} a year held long term.")
-
-        st.dataframe(pd.DataFrame([
-            {"Rung": f"IV{n}", "Price": v, "vs market": f"{price/v:.2f}x" if v > 0 else "—",
-             "Meaning": RUNG_MEANING[n]} for n, v in lad.items() if v == v
-        ]).style.format({"Price": "${:,.2f}"}), use_container_width=True, hide_index=True)
-        st.caption("Set alerts at every rung. Each is a separate run at its own discount rate.")
-
-        # ── stress test ─────────────────────────────────────────────
-        st.divider()
-        st.subheader("Stress test")
-        s1, s2 = st.columns(2)
-        keys = list(AICT)
-        worse = s1.selectbox("Downgrade the tier to", keys,
-                             index=min(len(keys) - 1, keys.index(tier) + 1))
-        cut = s2.slider("Cut the growth rate by (%)", 0, 80, 30, 5)
-
-        sp = IVParams(OE=OE, shares=shares, tier=worse, growth=growth * (1 - cut / 100),
-                      net_cash=net_cash, exit_multiple=exit_m, blend=blend,
-                      stage0_years=int(s0y), stage0_growth=s0g)
-        siv = intrinsic_value(sp, 15)
-        q = st.columns(3)
-        q[0].metric("Stressed IV15", f"${siv:,.2f}" if siv == siv and siv > 0 else "negative",
-                    f"{siv/iv15-1:+.1%}" if siv == siv and siv > 0 else None)
-        if siv == siv and siv > 0:
-            q[1].metric("Stressed Price / IV15", f"{price/siv:.2f}x", zone(price / siv)[0])
-            q[2].metric("Stressed expected return", f"{expected_return(price, sp):.1%}")
-            if price <= siv:
-                st.success("Still below IV15 even after the downgrade and the growth cut. "
-                           "That is what a margin of safety looks like.")
-            else:
-                st.info("Falls out of Fat Pitch territory under stress. Worth knowing what "
-                        "you are relying on.")
+        if ratio <= 1.0:
+            st.success(f"🎯 **FAT PITCH (BUY)**: at **${price:,.2f}**, {tk} trades below its IV15 "
+                       f"of **${iv15:,.2f}**, implying about **{er:.1%}** a year held long term.")
+        elif ratio <= 1.5:
+            st.info(f"⚠️ **JUST OUTSIDE (WATCHLIST)**: at **${price:,.2f}**, {tk} is at "
+                    f"{ratio:.2f}x its IV15 of **${iv15:,.2f}**. Expected return **{er:.1%}** "
+                    f"a year.")
         else:
-            st.error("Not investible under the stressed assumptions.")
+            st.error(f"⛔ **OUT FIELD (OVERVALUED)**: **${price:,.2f}** is well above IV15 of "
+                     f"**${iv15:,.2f}**. Expected return just **{er:.1%}** a year.")
+
+        st.write("**Target Entry Bands:**")
+        for n in (20, 18, 15, 12, 10, 8):
+            v = lad[n]
+            if v == v and v > 0:
+                st.write(f"- **{n}% Annual Return** ({RUNG_MEANING[n]}): buy under **${v:,.2f}**")
+        st.caption("Each band is a separate run at its own required return — they cannot be "
+                   "scaled off one another. Set price alerts at all of them.")
+
+        with st.expander("Calibrate against a published IV15"):
+            st.caption("If you have Burry's own IV15 for this stock, enter it and this solves "
+                       "for the growth rate that reproduces it — given your current exit multiple "
+                       "and blend. Useful for learning what assumptions his figures embed.")
+            target = st.number_input("Published IV15 ($)", value=0.0, step=0.01)
+            if target > 0:
+                try:
+                    from scipy.optimize import brentq
+                    solved = brentq(
+                        lambda g: intrinsic_value(
+                            IVParams(OE=OE, shares=shares, tier=tier_name, growth=g,
+                                     net_cash=net_cash, exit_multiple=exit_m,
+                                     blend=blend), 15) - target, -0.30, 1.00)
+                    st.success(f"A stage-1 growth rate of **{solved:.2%}** reproduces "
+                               f"${target:,.2f} with your current settings "
+                               f"(exit {exit_m:g}, blend {blend:g}).")
+                except Exception:
+                    st.error("No growth rate between -30% and +100% reaches that IV15. The exit "
+                             "multiple, blend, owners' earnings or share count is likely off.")
+
+        if siv == siv and siv > 0 and price <= siv:
+            st.success("Still below IV15 after a moat downgrade and a growth haircut. That is "
+                       "what a real margin of safety looks like.")
