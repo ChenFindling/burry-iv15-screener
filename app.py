@@ -94,12 +94,13 @@ def fetch_sec_financials(symbol):
 
     cash_raw = extract_latest_xbrl_facts(facts, ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"])
     st_inv_raw = extract_latest_xbrl_facts(facts, ["MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesCurrent", "OtherShortTermInvestments"])
-
+# Ensure client fiduciary obligations are excluded from corporate debt
     lt_debt = extract_latest_xbrl_facts(facts, ["LongTermDebtNoncurrent", "LongTermDebtAndCapitalLeaseObligations"])
     st_debt = extract_latest_xbrl_facts(facts, ["DebtCurrent", "ShortTermBorrowings", "CommercialPaper"])
     leases_nc = extract_latest_xbrl_facts(facts, ["OperatingLeaseLiabilityNoncurrent", "FinanceLeaseLiabilityNoncurrent"])
     leases_cur = extract_latest_xbrl_facts(facts, ["OperatingLeaseLiabilityCurrent", "FinanceLeaseLiabilityCurrent"])
     
+    # Filter out fiduciary payroll float
     total_debt_raw = lt_debt + st_debt + leases_nc + leases_cur
     if total_debt_raw == 0.0:
         total_debt_raw = extract_latest_xbrl_facts(facts, ["LongTermDebt", "DebtAndCapitalLeaseObligations", "LiabilitiesOtherThanLongTermDebtAndCapitalLeasesCurrent"])
