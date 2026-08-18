@@ -36,7 +36,6 @@ def get_xbrl_annual_val(facts_tree, concept_list, taxonomy="us-gaap"):
         if concept in facts_tree["facts"][taxonomy]:
             units_dict = facts_tree["facts"][taxonomy][concept].get("units", {})
             rows = units_dict.get("USD", units_dict.get("shares", []))
-            # Filter for completed 10-K full year filings
             fy_rows = [r for r in rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
             if fy_rows:
                 fy_rows.sort(key=lambda x: x.get("end", ""))
@@ -55,6 +54,30 @@ def get_xbrl_instant_val(facts_tree, concept_list, taxonomy="us-gaap"):
                 return float(rows[-1].get("val", 0.0))
     return 0.0
 
+def extract_dynamic_growth_rate(facts_tree):
+    """Calculates historical annual revenue growth from the last 2 completed 10-K periods."""
+    concepts = [
+        "RevenueFromContractWithCustomerExcludingAssessedTax",
+        "Revenues",
+        "SalesRevenueNet",
+        "RevenueFromContractWithCustomerIncludingAssessedTax"
+    ]
+    if "facts" in facts_tree and "us-gaap" in facts_tree["facts"]:
+        us_facts = facts_tree["facts"]["us-gaap"]
+        for concept in concepts:
+            if concept in us_facts:
+                units = us_facts[concept].get("units", {}).get("USD", [])
+                fy_rows = [r for r in units if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+                if len(fy_rows) >= 2:
+                    # Sort chronologically to get the latest 2 years
+                    fy_rows.sort(key=lambda x: x.get("end", ""))
+                    v_latest = float(fy_rows[-1].get("val", 0.0))
+                    v_prev = float(fy_rows[-2].get("val", 0.0))
+                    if v_prev > 0 and v_latest > 0:
+                        g = (v_latest - v_prev) / v_prev
+                        return float(max(0.03, min(g, 0.22)))
+    return 0.10
+
 def fetch_sec_data(symbol):
     mapping = get_sec_ticker_mapping()
     if symbol not in mapping:
@@ -69,23 +92,23 @@ def fetch_sec_data(symbol):
     facts = res.json()
 
     # 1. Income & SBC (Audited Full Year 10-K)
-    N_val = get_xbrl_annual_val(facts, ["NetIncomeLoss", "NetIncomeLossAvailableToCommonStockholdersBasic", "ProfitLoss"])
+    N_val = get_xbrl_annual_val(facts, ["NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLoss", "ProfitLoss"])
     G_val = get_xbrl_annual_val(facts, ["AllocatedShareBasedCompensationExpense", "ShareBasedCompensation", "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense"])
-    T_val = get_xbrl_annual_val(facts, ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity"])
+    T_val = get_xbrl_annual_val(facts, ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity", "PaymentsRelatedToTaxWithholdingForShareBasedCompensation"])
 
     # 2. Balance Sheet Cash & Marketable Securities
     cash_val = get_xbrl_instant_val(facts, ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"])
     st_inv_val = get_xbrl_instant_val(facts, ["MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesCurrent", "OtherShortTermInvestments"])
 
-    # 3. Funded Debt (Excludes Payroll Fiduciary Obligations & Operating Leases)
+    # 3. Funded Corporate Debt
     lt_debt = get_xbrl_instant_val(facts, ["LongTermDebtNoncurrent", "LongTermDebt"])
     st_debt = get_xbrl_instant_val(facts, ["DebtCurrent", "ShortTermBorrowings", "CommercialPaper"])
     total_debt_val = lt_debt + st_debt
 
-    # 4. Shares Outstanding
-    shares_val = get_xbrl_instant_val(facts, ["EntityCommonStockSharesOutstanding"], taxonomy="dei")
+    # 4. Diluted Share Count
+    shares_val = get_xbrl_annual_val(facts, ["WeightedAverageNumberOfDilutedSharesOutstanding", "WeightedAverageNumberOfSharesOutstandingDiluted"])
     if shares_val == 0.0:
-        shares_val = get_xbrl_annual_val(facts, ["WeightedAverageNumberOfDilutedSharesOutstanding"])
+        shares_val = get_xbrl_instant_val(facts, ["EntityCommonStockSharesOutstanding"], taxonomy="dei")
     if shares_val == 0.0:
         shares_val = get_xbrl_instant_val(facts, ["CommonStockSharesOutstanding"])
 
@@ -99,6 +122,8 @@ def fetch_sec_data(symbol):
     except Exception:
         pass
 
+    g1_val = extract_dynamic_growth_rate(facts)
+
     return {
         "ticker": symbol,
         "price": price_val,
@@ -108,12 +133,12 @@ def fetch_sec_data(symbol):
         "T": abs(T_val) / 1e6,
         "total_cash": (cash_val + st_inv_val) / 1e6,
         "total_debt": total_debt_val / 1e6,
-        "g1": 0.10
+        "g1": g1_val
     }
 
 # Search Bar
-ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. NVDA, MSFT, TSLA, ADBE, INTU").upper().strip()
-tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=3)
+ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ADBE, CRM, GOOGL, ADSK, PAYC").upper().strip()
+tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=2)
 tier = AICT_TIERS[tier_name]
 
 if st.button("Evaluate Stock", type="primary"):
@@ -160,12 +185,11 @@ if "calc_data" in st.session_state and ticker and st.session_state["calc_data"][
     d2.metric("Dilution Tax Rate", f"{dilution_tax_rate:.1f}%", "Transfer from owners")
     d3.metric("Buyback Offset Drag", f"{buyback_treadmill_pct:.1f}%", "Used to offset SBC")
 
-    # Refined alert: Only flag high dilution if buybacks are mostly offsetting SBC AND dilution tax is high
     if buyback_treadmill_pct > 80.0:
         st.warning("⚠️ **Hamster Wheel Alert:** Over 80% of company buybacks merely neutralize employee stock grants rather than reducing share count!")
     elif dilution_tax_rate > 30.0 and buyback_treadmill_pct > 50.0:
         st.info("ℹ️ **High Dilution Drag:** Stock-based compensation significantly reduces the earnings attributable to common shareholders.")
-        
+
     # 4. Valuation Engine Helper
     def run_valuation(oe_b, g_rate, t_rules, m_exit, s_count, c_val, d_val):
         g_two = g_rate * t_rules["mult"]
