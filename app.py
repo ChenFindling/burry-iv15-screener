@@ -36,6 +36,14 @@ def get_xbrl_annual_val(facts_tree, concept_list, taxonomy="us-gaap"):
         if concept in facts_tree["facts"][taxonomy]:
             units_dict = facts_tree["facts"][taxonomy][concept].get("units", {})
             rows = units_dict.get("USD", units_dict.get("shares", []))
+            
+            # Gold Standard: Extract only SEC authoritative consolidated "frames" (e.g. CY2023)
+            frame_rows = [r for r in rows if "frame" in r and len(r["frame"]) == 6]
+            if frame_rows:
+                frame_rows.sort(key=lambda x: x.get("end", ""))
+                return float(frame_rows[-1].get("val", 0.0))
+            
+            # Fallback: strict 10-K extraction
             fy_rows = [r for r in rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
             if fy_rows:
                 fy_rows.sort(key=lambda x: x.get("end", ""))
@@ -49,9 +57,18 @@ def get_xbrl_instant_val(facts_tree, concept_list, taxonomy="us-gaap"):
         if concept in facts_tree["facts"][taxonomy]:
             units_dict = facts_tree["facts"][taxonomy][concept].get("units", {})
             rows = units_dict.get("USD", units_dict.get("shares", []))
-            if rows:
-                rows.sort(key=lambda x: x.get("end", ""))
-                return float(rows[-1].get("val", 0.0))
+            
+            # Gold Standard: Extract only SEC authoritative consolidated instant "frames" (e.g. CY2023Q4I)
+            frame_rows = [r for r in rows if "frame" in r and r["frame"].endswith("I")]
+            if frame_rows:
+                frame_rows.sort(key=lambda x: x.get("end", ""))
+                return float(frame_rows[-1].get("val", 0.0))
+            
+            # Fallback: strictly filter out 8-Ks and segment dumps
+            valid_rows = [r for r in rows if r.get("form") in ["10-K", "10-Q"]]
+            if valid_rows:
+                valid_rows.sort(key=lambda x: (x.get("end", ""), x.get("filed", "")))
+                return float(valid_rows[-1].get("val", 0.0))
     return 0.0
 
 def extract_dynamic_growth_rate(facts_tree):
@@ -66,7 +83,10 @@ def extract_dynamic_growth_rate(facts_tree):
         for concept in concepts:
             if concept in us_facts:
                 units = us_facts[concept].get("units", {}).get("USD", [])
-                fy_rows = [r for r in units if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+                fy_rows = [r for r in units if "frame" in r and len(r["frame"]) == 6]
+                if not fy_rows:
+                    fy_rows = [r for r in units if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+                
                 if len(fy_rows) >= 2:
                     fy_rows.sort(key=lambda x: x.get("end", ""))
                     v_latest = float(fy_rows[-1].get("val", 0.0))
@@ -113,24 +133,27 @@ def fetch_sec_data(symbol):
     ])
     st_inv_val = get_xbrl_instant_val(facts, [
         "MarketableSecuritiesCurrent", 
-        "AvailableForSaleSecuritiesCurrent",
-        "MarketableSecurities"
+        "AvailableForSaleSecuritiesCurrent"
     ])
 
-    # 3. Total Funded Debt (Includes Oracle's NotesPayable tags)
+    # 3. Total Funded Debt
     lt_debt = get_xbrl_instant_val(facts, [
+        "LongTermDebtNoncurrent",
         "NotesPayableAndOtherBorrowingsNoncurrent",
-        "LongTermDebtNoncurrent", 
         "LongTermDebtAndCapitalLeaseObligations", 
         "SeniorNotes",
-        "LongTermDebt"
+        "LongTermDebt",
+        "ConvertibleDebtNoncurrent",
+        "NotesPayableNoncurrent"
     ])
     st_debt = get_xbrl_instant_val(facts, [
-        "NotesPayableAndOtherBorrowingsCurrent",
         "DebtCurrent", 
+        "NotesPayableAndOtherBorrowingsCurrent",
         "ShortTermBorrowings", 
         "CommercialPaper",
-        "LongTermDebtCurrent"
+        "LongTermDebtCurrent",
+        "LinesOfCreditCurrent",
+        "NotesPayableCurrent"
     ])
     total_debt_val = lt_debt + st_debt
 
@@ -169,7 +192,7 @@ def fetch_sec_data(symbol):
     }
 
 # Search Bar
-ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ORCL, ADBE, NOW, CRM, GOOGL").upper().strip()
+ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ORCL, ADBE, NOW, CRM, GOOGL, CRDO").upper().strip()
 tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=3)
 tier = AICT_TIERS[tier_name]
 
@@ -177,7 +200,7 @@ if st.button("Evaluate Stock", type="primary"):
     if not ticker:
         st.warning("Please enter a stock ticker symbol first.")
     else:
-        with st.spinner(f"Pulling SEC EDGAR audited 10-K data for {ticker}..."):
+        with st.spinner(f"Pulling SEC EDGAR authoritative consolidated data for {ticker}..."):
             try:
                 st.session_state["calc_data"] = fetch_sec_data(ticker)
             except Exception as e:
