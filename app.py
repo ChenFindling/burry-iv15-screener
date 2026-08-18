@@ -62,21 +62,32 @@ class Tier:
     def horizon(self) -> int:
         return self.stage1_years + self.stage2_years
 
+    traded_multiple: float = 14.5
+
     @property
-    def default_exit_multiple(self) -> float:
-        """(1+g)/(r-g) at r=15%, i.e. the multiple the tier's own terminal
-        growth cap already implies. Internally consistent rather than invented,
-        and a far better starting point than one number for every tier — a
-        Stone business in decline should never inherit a Fortress multiple."""
+    def perpetuity_equivalent(self) -> float:
+        """(1+g)/(r-g) at r=15% — the multiple this tier's own terminal growth
+        already implies. A useful floor, but too punitive as a default: Burry
+        applies 'a multiple based on my experience with traded multiples' to
+        year-15 earnings, and traded multiples sit well above perpetuity maths."""
         return (1 + self.terminal_growth_cap) / (0.15 - self.terminal_growth_cap)
 
+    @property
+    def default_exit_multiple(self) -> float:
+        return self.traded_multiple
 
+
+# Stage durations, multipliers, terminal caps and debt capacity are published.
+# The traded exit multiple is NOT — these are calibrated so that the growth rate
+# needed to reproduce a published IV15 matches the company's actual growth.
+# Adobe is the anchor: at 14.5x, reaching his $262 needs 11.1% growth, and Adobe
+# grew 11%. Treat them as reasonable starting points, not gospel.
 AICT: dict[str, Tier] = {
-    "Fortress": Tier(8, 16, 0.70, 0.07, 3.0),
-    "Castle":   Tier(7, 13, 0.55, 0.05, 2.5),
-    "Chapel":   Tier(5, 10, 0.45, 0.04, 2.0),
-    "Stone":    Tier(4,  7, 0.35, 0.03, 0.0),
-    "Wood":     Tier(2,  4, 0.25, 0.00, 0.0),
+    "Fortress": Tier(8, 16, 0.70, 0.07, 3.0, 20.0),
+    "Castle":   Tier(7, 13, 0.55, 0.05, 2.5, 16.0),
+    "Chapel":   Tier(5, 10, 0.45, 0.04, 2.0, 14.5),
+    "Stone":    Tier(4,  7, 0.35, 0.03, 0.0,  9.0),
+    "Wood":     Tier(2,  4, 0.25, 0.00, 0.0,  5.0),
 }
 
 TIER_BLURB = {
@@ -251,6 +262,15 @@ def intrinsic_value(p: IVParams, required_return_pct: float) -> float:
     m2 = pv2 + s2[-1] * p.exit_multiple / (1 + r) ** 15
 
     return (p.blend * m1 + (1 - p.blend) * m2 + p.net_cash) / p.shares
+
+
+def model_legs(p: IVParams, required_return_pct: float = 15.0) -> tuple[float, float]:
+    """Per-share value from each leg, so the blend's effect is visible rather
+    than buried. A wide spread means the blend choice is doing a lot of work."""
+    a = IVParams(**{**p.__dict__, "blend": 1.0})
+    b = IVParams(**{**p.__dict__, "blend": 0.0})
+    return (intrinsic_value(a, required_return_pct),
+            intrinsic_value(b, required_return_pct))
 
 
 def ladder(p: IVParams) -> dict[int, float]:
@@ -469,8 +489,21 @@ def load(ticker: str, n_years: int = 10):
     net_cash = g(BALANCE["cash"]) + g(BALANCE["sti"]) + g(BALANCE["lti"]) \
         - g(BALANCE["ltd"]) - g(BALANCE["std"])
 
+    # Most recent shares OUTSTANDING beats trailing weighted-average diluted.
+    # Under a heavy buyback the weighted average is stale and systematically
+    # high, which depresses every per-share figure. Adobe: 427M weighted vs
+    # ~408M actual, a 4.7% error straight through to IV15.
     sh = series.get("SHD", {})
-    diluted = (sh[fys[-1]][2] if fys[-1] in sh else shares_out.get(fys[-1], 0.0)) / 1e6
+    diluted = 0.0
+    if shares_out:
+        diluted = shares_out[max(shares_out)] / 1e6
+    if diluted <= 0 and sh:
+        diluted = sh[max(sh)][2] / 1e6
+    if shares_out and sh and max(sh) in sh:
+        _wavg = sh[max(sh)][2] / 1e6
+        if _wavg > 0 and abs(diluted / _wavg - 1) > 0.03:
+            notes.append(f"Shares outstanding {diluted:,.1f}M vs weighted-average diluted "
+                         f"{_wavg:,.1f}M. Using the current count; buybacks make the average stale.")
 
     rev = series.get("REV", {})
     ry = sorted(rev)
@@ -605,10 +638,11 @@ if years and ticker and st.session_state.get("tk") == ticker:
 
     with st.expander("Model settings"):
         m1, m2 = st.columns(2)
-        exit_m = m1.number_input("Exit multiple", value=round(AICT[tier_name].default_exit_multiple, 2),
-                                 step=0.5, help="Applied to year-15 owners' earnings. Defaults to "
-                                                "the multiple this tier's terminal growth already "
-                                                "implies. Burry never published his.")
+        exit_m = m1.number_input(
+            "Exit multiple", value=round(AICT[tier_name].default_exit_multiple, 2), step=0.5,
+            help=f"Applied to year-15 owners' earnings. Burry never published his; this default "
+                 f"is calibrated against Adobe. This tier's perpetuity floor is "
+                 f"{AICT[tier_name].perpetuity_equivalent:.1f}x.")
         blend = m2.slider("Long-horizon weight", 0.0, 1.0, 0.5, 0.05,
                           help="IV15 blends a perpetuity model with an exit-multiple model. "
                                "Moves the answer materially — about \\$10 on CRM.")
@@ -616,6 +650,13 @@ if years and ticker and st.session_state.get("tk") == ticker:
         st.caption(f"{tier_name}: stage 1 {t.stage1_years}y, stage 2 {t.stage2_years}y at "
                    f"{t.stage2_multiplier:.2f}x, terminal cap {t.terminal_growth_cap:.0%}, "
                    f"total horizon {t.horizon} years.")
+        _l1, _l2 = model_legs(IVParams(OE=OE, shares=shares, tier=tier_name, growth=growth,
+                                       net_cash=net_cash, exit_multiple=exit_m, blend=blend))
+        if _l1 == _l1 and _l2 == _l2:
+            st.caption(f"Long-horizon leg ${_l1:,.2f} · exit-multiple leg ${_l2:,.2f}. "
+                       + ("They agree closely, so the blend barely matters here."
+                          if abs(_l1 - _l2) / max(_l1, 1) < 0.1 else
+                          "They diverge, so the blend is doing real work — worth a look."))
 
     if not dE_ok:
         alerts.append(("error",
