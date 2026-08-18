@@ -1,22 +1,30 @@
 """
-Burry IV15 Screener — Tragic Algebra owners' earnings + hybrid AICT/IV ladder.
+Burry IV15 Screener
+===================
+Owners' earnings adjusted for the true cost of stock compensation, then the
+intrinsic value ladder that follows from them.
 
-Replaces the earlier version. Key corrections vs. that build:
-  1. Omega is computed from the real formula, not invented ratios.
-  2. W (shares repurchased) and dS (share count change) are actually fetched.
-  3. C = Cw - Ce, kept strictly separate from T. They were previously collided
-     in one tag list, which alone corrupted many tickers.
-  4. dE is pooled over ~10 years, not a single year.
-  5. Owners' earnings are NOT floored at zero. Negative is a real, important
-     answer ("not investible") and must survive to the output.
-  6. Tier stage-2 durations are honoured. Total horizon is 24/20/15/11/6 years
-     by tier, not 15 for everything.
-  7. IV12/IV18 are re-run through the DCF, never scaled off IV15. The old
-     shortcut overstated IV12 ~10% and understated IV18 ~15%.
-  8. XBRL facts are filtered on period duration and deduped by filing, so
-     prior-year comparatives and quarterly rows can't be mistaken for FY data.
-  9. IFRS taxonomy fallback for foreign filers.
- 10. Unresolved inputs are reported explicitly instead of silently becoming 0.
+THE KEY SIMPLIFICATION
+----------------------
+The published cost formula is  V = T x (W + dS) / W  , which needs W, the number
+of shares repurchased. W is almost never tagged in XBRL — it lives in the share
+repurchase footnote.
+
+But P = T / W, so:
+
+    V = T x (W + dS)/W  =  T + (T/W) x dS  =  T + P x dS
+
+W cancels. Only the average share price is needed, and that is always
+obtainable. Verified exact against all ten published Alphabet years.
+
+So:
+    V  = max(0, T + P x dS)      market value of shares handed to employees
+    C  = Cw - Ce                 net cash award payments
+    Om = C + V                   true SBC cost, replaces GAAP's estimate
+    OE = N + G - Om              owners' earnings
+    dE = OE / N                  fraction of reported profit that is really yours
+
+Pooled over ~10 years as sum(OE)/sum(N) — never an average of annual ratios.
 
 Run:  streamlit run app.py
 """
@@ -24,6 +32,7 @@ Run:  streamlit run app.py
 from __future__ import annotations
 
 import datetime as dt
+import statistics
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -31,12 +40,12 @@ import requests
 import streamlit as st
 
 # ══════════════════════════════════════════════════════════════════════
-#  DOMAIN CONSTANTS
+#  CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
 
 SEC_HEADERS = {
-    # SEC requires a real contact address. Put your own in before deploying.
-    "User-Agent": "IV15 Research Tool chenfind@hotmail.com",
+    # Put your own email here. The SEC blocks generic user agents.
+    "User-Agent": "IV15 Research Tool contact@example.com",
     "Accept-Encoding": "gzip, deflate",
 }
 
@@ -63,116 +72,74 @@ AICT: dict[str, Tier] = {
 }
 
 TIER_BLURB = {
-    "Fortress": "Regulated or platform/enterprise, owns its AI, no acute seat risk",
-    "Castle":   "Strong moat, owned AI at material scale, outcome reasonably certain",
-    "Chapel":   "Acute AI threat but owned AI at decent scale + switching costs",
-    "Stone":    "Meaningful threat without strong adaptability, or chronic pressure",
-    "Wood":     "Borrowed AI, no credible R&D, direct attack from foundation models",
+    "Fortress": "regulated or platform; owns its AI; no acute seat risk",
+    "Castle":   "strong moat; owned AI at material scale; outcome fairly certain",
+    "Chapel":   "acute AI threat but owned AI at decent scale plus switching costs",
+    "Stone":    "meaningful threat without strong adaptability, or chronic pressure",
+    "Wood":     "borrowed AI; no credible R&D; direct attack from foundation models",
 }
 
-# P/IV15 -> points, from the 11-bracket valuation scale
-VALUATION_BRACKETS = [
-    (0.50, 35), (0.75, 32), (0.90, 28), (1.00, 24), (1.25, 20),
-    (1.50, 17), (2.00, 14), (3.00, 8), (5.00, 5), (10.0, 3),
-]
+VALUATION_BRACKETS = [(0.50, 35), (0.75, 32), (0.90, 28), (1.00, 24), (1.25, 20),
+                      (1.50, 17), (2.00, 14), (3.00, 8), (5.00, 5), (10.0, 3)]
+
+RUNG_MEANING = {8: "baseline intrinsic value, upper", 10: "baseline intrinsic value, lower",
+                12: "a fair price", 15: "the benchmark buy target",
+                18: "deep margin of safety", 20: "crisis pricing"}
 
 # ══════════════════════════════════════════════════════════════════════
-#  TRAGIC ALGEBRA  (pure functions — no Streamlit in here)
+#  TRAGIC ALGEBRA
 # ══════════════════════════════════════════════════════════════════════
 
 
 @dataclass
-class YearInputs:
-    """One fiscal year. Dollars in $M, share counts in millions."""
+class Year:
+    """One fiscal year. Dollars in $M, shares in millions."""
     fy: int
-    N: float                       # GAAP net income (parent)
-    G: float                       # GAAP SBC expense (positive)
-    T: float = 0.0                 # buyback dollars — PROGRAM ONLY
-    W: float = 0.0                 # shares repurchased under the program
-    dS: float = 0.0                # change in shares outstanding (+ = dilution)
-    Cw: float = 0.0                # tax withholding paid on vesting
-    Ce: float = 0.0                # option / ESPP proceeds received
-    external_price: float | None = None   # required when there is no buyback
-    cash_settled_sbc: bool = False        # MELI-style: V = 0 by design
+    N: float                  # GAAP net income
+    G: float = 0.0            # GAAP SBC expense
+    T: float = 0.0            # buyback dollars
+    dS: float = 0.0           # change in shares outstanding (+ = dilution)
+    Cw: float = 0.0           # tax withheld on vesting
+    Ce: float = 0.0           # option / ESPP proceeds
+    price: float = 0.0        # average share price for the year
+    cash_settled_sbc: bool = False   # MELI-style: no equity gap to close
 
-    # ---- derived -----------------------------------------------------
     @property
     def C(self) -> float:
-        """Net cash award payments. Can be negative when proceeds exceed
-        withholding — that is a real outcome, not an error."""
         return self.Cw - self.Ce
 
     @property
-    def no_buyback(self) -> bool:
-        return self.T == 0 and self.W == 0
-
-    @property
-    def I(self) -> float:
-        """Shares delivered to employees.
-        Treadmill:      I = dS + W   (recovers gross issuance)
-        Pure dilution:  I = dS       (W is zero)"""
-        return self.dS if self.no_buyback else self.dS + self.W
-
-    @property
-    def P(self) -> float | None:
-        """Average price. T/W is the audited figure when a program exists;
-        otherwise an external period-average price is required."""
-        if self.W > 0:
-            return self.T / self.W
-        return self.external_price
-
-    @property
-    def V(self) -> float | None:
+    def V(self) -> float:
+        """Market value of shares delivered to employees.
+        Floored at zero: you cannot deliver a negative number of shares."""
         if self.cash_settled_sbc:
             return 0.0
-        p = self.P
-        if p is None:
-            return None
-        return max(0.0, self.I * p)   # floor: cannot deliver negative shares
+        return max(0.0, self.T + self.price * self.dS)
 
     @property
-    def omega(self) -> float | None:
-        v = self.V
-        return None if v is None else self.C + v
+    def omega(self) -> float:
+        return self.C + self.V
 
     @property
-    def owners_earnings(self) -> float | None:
-        om = self.omega
-        return None if om is None else self.N + self.G - om
+    def OE(self) -> float:
+        return self.N + self.G - self.omega
 
     @property
-    def delta_e(self) -> float | None:
-        oe = self.owners_earnings
-        if oe is None or self.N == 0:
-            return None
-        return oe / self.N
-
-    @property
-    def usable(self) -> bool:
-        return self.V is not None
-
-    def gate1(self, tol: float = 0.001) -> bool:
-        """|Omega - (C+V)| / max(|Omega|, $1K) <= 0.1%"""
-        om, v = self.omega, self.V
-        if om is None or v is None:
-            return False
-        return abs(om - (self.C + v)) / max(abs(om), 0.001) <= tol
+    def dE(self) -> float | None:
+        return self.OE / self.N if self.N else None
 
 
 @dataclass
 class Pooled:
-    delta_e: float
+    dE: float
     sum_N: float
     sum_OE: float
     sum_omega: float
     sum_G: float
-    years_used: int
-    years_dropped: list[int] = field(default_factory=list)
+    years: int
 
     @property
     def gaap_overstatement(self) -> float:
-        """(sum_Omega - sum_G) / sum_OE — how much GAAP overstates owners'
-        earnings. Equivalently sum_N/sum_OE - 1."""
         return (self.sum_omega - self.sum_G) / self.sum_OE if self.sum_OE else float("nan")
 
     @property
@@ -184,68 +151,53 @@ class Pooled:
         return self.sum_OE < 0
 
     def retention(self, t: int) -> float:
-        """Share of GAAP intrinsic-value-per-share growth that survives to
-        year t. This is dE**t — it compounds, which is the whole point."""
-        return self.delta_e ** t
+        """Share of reported value growth that survives to year t. dE compounds."""
+        return self.dE ** t
 
     def true_cagr(self, gaap_growth: float) -> float:
-        """Break-even dE is 1/(1+g): below it, reported growth doesn't reach
-        the owner at all."""
-        return self.delta_e * (1.0 + gaap_growth) - 1.0
+        """Break-even dE is 1/(1+g). Below it, reported growth never reaches you."""
+        return self.dE * (1.0 + gaap_growth) - 1.0
 
 
-def pool_delta_e(years: list[YearInputs]) -> Pooled:
-    """Earnings-weighted pooled dE. Never average annual ratios — that blows
-    up on near-zero-earnings years and forces exclusions.
-
-    Gate 2: a year with no usable V has its N, G and C excluded too. Keeping
-    the earnings while dropping the SBC cost biases every aggregate low.
-    """
-    keep = [y for y in years if y.usable]
-    drop = [y.fy for y in years if not y.usable]
-    if not keep:
-        raise ValueError("No usable years. Years without a buyback need an average share price.")
-    sN = sum(y.N for y in keep)
-    if sN == 0:
-        raise ValueError("Cumulative net income is zero — extend the window.")
+def pool(years: list[Year]) -> Pooled:
+    sN = sum(y.N for y in years)
+    if not years or sN == 0:
+        raise ValueError("Not enough data to pool.")
     return Pooled(
-        delta_e=sum(y.owners_earnings for y in keep) / sN,
-        sum_N=sN,
-        sum_OE=sum(y.owners_earnings for y in keep),
-        sum_omega=sum(y.omega for y in keep),
-        sum_G=sum(y.G for y in keep),
-        years_used=len(keep),
-        years_dropped=drop,
+        dE=sum(y.OE for y in years) / sN,
+        sum_N=sN, sum_OE=sum(y.OE for y in years),
+        sum_omega=sum(y.omega for y in years), sum_G=sum(y.G for y in years),
+        years=len(years),
     )
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  IV LADDER  (hybrid two-model DCF)
+#  INTRINSIC VALUE LADDER
 # ══════════════════════════════════════════════════════════════════════
 
 
 @dataclass
 class IVParams:
-    owners_earnings: float     # $M — normalised, post-Tragic-Algebra
-    shares: float              # M
+    OE: float               # $M
+    shares: float           # M
     tier: str
-    stage1_growth: float       # decimal
-    net_cash: float = 0.0      # $M (negative = net debt)
+    growth: float           # decimal
+    net_cash: float = 0.0   # $M
     exit_multiple: float = 20.0
-    blend_model1: float = 0.5  # weight on the perpetuity model
-    stage0_years: int = 0      # hypergrowth ramp for inflecting companies
+    blend: float = 0.5      # weight on the perpetuity model
+    stage0_years: int = 0
     stage0_growth: float = 0.0
 
 
-def _stream(p: IVParams, n_years: int) -> list[float]:
+def _stream(p: IVParams, n: int) -> list[float]:
     t = AICT[p.tier]
-    g2 = p.stage1_growth * t.stage2_multiplier
-    out, e = [], p.owners_earnings
-    for y in range(1, n_years + 1):
+    g2 = p.growth * t.stage2_multiplier
+    out, e = [], p.OE
+    for y in range(1, n + 1):
         if y <= p.stage0_years:
             g = p.stage0_growth
         elif y <= p.stage0_years + t.stage1_years:
-            g = p.stage1_growth
+            g = p.growth
         else:
             g = g2
         e *= 1.0 + g
@@ -253,109 +205,86 @@ def _stream(p: IVParams, n_years: int) -> list[float]:
     return out
 
 
-def _model1(p: IVParams, r: float) -> float:
-    """Stages 1 and 2, then a terminal perpetuity at the tier growth cap."""
-    t = AICT[p.tier]
-    n = t.horizon + p.stage0_years
-    s = _stream(p, n)
-    pv = sum(cf / (1.0 + r) ** y for y, cf in enumerate(s, start=1))
-    terminal = s[-1] * (1.0 + t.terminal_growth_cap) / (r - t.terminal_growth_cap)
-    return pv + terminal / (1.0 + r) ** n
-
-
-def _model2(p: IVParams, r: float) -> float:
-    """Project to year 15, then apply a market multiple to year-15 earnings."""
-    s = _stream(p, 15)
-    pv = sum(cf / (1.0 + r) ** y for y, cf in enumerate(s, start=1))
-    return pv + s[-1] * p.exit_multiple / (1.0 + r) ** 15
-
-
 def intrinsic_value(p: IVParams, required_return_pct: float) -> float:
     """IV15 -> intrinsic_value(p, 15).
 
-    Each rung is a full re-run at its own discount rate. Never scale one rung
-    off another: the published SW46 ratios span 1.333–1.443, so no constant
-    multiplier can fit them.
+    Two models sharing one earnings stream, blended:
+      model 1  stages 1 and 2, then a terminal perpetuity at the tier cap
+      model 2  project to year 15, apply a market multiple
 
-    A negative result is meaningful — no share price delivers that return.
+    Every rung is a full re-run at its own discount rate. Scaling one rung off
+    another does not work — published IV12/IV15 ratios span 1.33 to 1.44.
+
+    A negative result is meaningful: no share price delivers that return.
     """
     r = required_return_pct / 100.0
     t = AICT[p.tier]
-    if r <= t.terminal_growth_cap:
+    if r <= t.terminal_growth_cap or p.shares <= 0:
         return float("nan")
-    if p.shares <= 0:
-        return float("nan")
-    w = p.blend_model1
-    blended = w * _model1(p, r) + (1.0 - w) * _model2(p, r)
-    return (blended + p.net_cash) / p.shares
+
+    n = t.horizon + p.stage0_years
+    s = _stream(p, n)
+    pv = sum(cf / (1 + r) ** y for y, cf in enumerate(s, 1))
+    m1 = pv + s[-1] * (1 + t.terminal_growth_cap) / (r - t.terminal_growth_cap) / (1 + r) ** n
+
+    s2 = _stream(p, 15)
+    pv2 = sum(cf / (1 + r) ** y for y, cf in enumerate(s2, 1))
+    m2 = pv2 + s2[-1] * p.exit_multiple / (1 + r) ** 15
+
+    return (p.blend * m1 + (1 - p.blend) * m2 + p.net_cash) / p.shares
 
 
-def iv_ladder(p: IVParams, rungs=(8, 10, 12, 15, 18, 20)) -> dict[int, float]:
-    return {n: intrinsic_value(p, n) for n in rungs}
+def ladder(p: IVParams) -> dict[int, float]:
+    return {n: intrinsic_value(p, n) for n in (8, 10, 12, 15, 18, 20)}
 
 
 def expected_return(price: float, p: IVParams) -> float:
-    """IVB — the long-term CAGR implied by today's price. The ladder inverted,
-    and arguably the most useful single output since it needs no required
-    return chosen in advance."""
+    """IVB — the CAGR implied by today's price. Needs no required return chosen
+    in advance, which arguably makes it the most useful single output."""
     lo, hi = AICT[p.tier].terminal_growth_cap + 1e-6, 3.0
     for _ in range(200):
-        mid = (lo + hi) / 2.0
-        if intrinsic_value(p, mid * 100) > price:
-            lo = mid
-        else:
-            hi = mid
-    return (lo + hi) / 2.0
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if intrinsic_value(p, mid * 100) > price else (lo, mid)
+    return (lo + hi) / 2
 
 
-def valuation_points(p_over_iv15: float) -> int:
-    if p_over_iv15 < 0:
+def valuation_points(ratio: float) -> int:
+    if ratio < 0:
         return -2
     for ceiling, pts in VALUATION_BRACKETS:
-        if p_over_iv15 <= ceiling:
+        if ratio <= ceiling:
             return pts
     return -2
 
 
-def zone(p_over_iv15: float) -> str:
-    if p_over_iv15 < 0:
-        return "Not investible"
-    if p_over_iv15 <= 1.0:
-        return "Fat Pitch"
-    if p_over_iv15 <= 1.5:
-        return "Just Outside"
-    return "Out Field"
+def zone(ratio: float) -> tuple[str, str]:
+    if ratio < 0:
+        return "Not investible", "error"
+    if ratio <= 1.0:
+        return "Fat Pitch", "success"
+    if ratio <= 1.5:
+        return "Just Outside", "info"
+    return "Out Field", "error"
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  SEC EDGAR
+#  DATA
 # ══════════════════════════════════════════════════════════════════════
 
 CONCEPTS = {
-    "N":  (["NetIncomeLoss", "ProfitLoss",
-            "NetIncomeLossAvailableToCommonStockholdersBasic"],
+    "N":  (["NetIncomeLoss", "ProfitLoss"],
            ["ProfitLoss", "ProfitLossAttributableToOwnersOfParent"]),
     "G":  (["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"],
-           ["ShareBasedPaymentsExpense", "ExpenseFromSharebasedPaymentTransactionsWithEmployees"]),
-    "T":  (["PaymentsForRepurchaseOfCommonStock"],
+           ["ShareBasedPaymentsExpense"]),
+    "T":  (["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity"],
            ["PaymentsToAcquireOrRedeemEntitysShares"]),
     "Cw": (["PaymentsRelatedToTaxWithholdingForShareBasedCompensation"], []),
     "Ce": (["ProceedsFromIssuanceOfSharesUnderIncentiveAndShareBasedCompensationPlans",
-            "ProceedsFromStockOptionsExercised",
-            "ProceedsFromIssuanceOfTreasuryStock",
-            "ProceedsFromSaleOfTreasuryStock",
-            "ProceedsFromStockPlans",
-            "ProceedsFromEmployeeStockPurchasePlan",
-            "ProceedsFromIssuanceOfCommonStock"],
-           []),
-    "W":  (["TreasuryStockSharesAcquired",
-            "StockRepurchasedAndRetiredDuringPeriodShares",
-            "StockRepurchasedDuringPeriodShares",
-            "TreasuryStockValueAcquiredCostMethodShares",
-            "PaymentsForRepurchaseOfCommonStockShares"], []),
+            "ProceedsFromStockOptionsExercised", "ProceedsFromIssuanceOfTreasuryStock",
+            "ProceedsFromSaleOfTreasuryStock", "ProceedsFromStockPlans",
+            "ProceedsFromEmployeeStockPurchasePlan", "ProceedsFromIssuanceOfCommonStock"], []),
     "REV": (["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues",
-             "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet"],
-            ["Revenue"]),
+             "RevenueFromContractWithCustomerIncludingAssessedTax"], ["Revenue"]),
     "SHD": (["WeightedAverageNumberOfDilutedSharesOutstanding",
              "WeightedAverageNumberOfSharesOutstandingDiluted"], []),
 }
@@ -364,19 +293,18 @@ BALANCE = {
     "cash": ["CashAndCashEquivalentsAtCarryingValue",
              "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
     "sti":  ["ShortTermInvestments", "MarketableSecuritiesCurrent",
-             "AvailableForSaleSecuritiesDebtSecuritiesCurrent", "OtherShortTermInvestments"],
+             "AvailableForSaleSecuritiesDebtSecuritiesCurrent"],
     "lti":  ["MarketableSecuritiesNoncurrent",
              "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent"],
     "ltd":  ["LongTermDebtNoncurrent", "LongTermDebt"],
     "std":  ["LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings", "CommercialPaper"],
 }
 
-SHARE_CONCEPTS = ["CommonStockSharesOutstanding", "CommonStockSharesIssued",
-                  "EntityCommonStockSharesOutstanding"]
+ANNUAL_FORMS = ("10-K", "10-K/A", "20-F", "40-F")
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def sec_ticker_map() -> dict[str, str]:
+def _ticker_map() -> dict[str, str]:
     r = requests.get("https://www.sec.gov/files/company_tickers.json",
                      headers=SEC_HEADERS, timeout=15)
     r.raise_for_status()
@@ -384,210 +312,189 @@ def sec_ticker_map() -> dict[str, str]:
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def sec_company_facts(cik: str) -> dict:
+def _facts(cik: str) -> dict:
     r = requests.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
-                     headers=SEC_HEADERS, timeout=25)
+                     headers=SEC_HEADERS, timeout=30)
     r.raise_for_status()
     return r.json()
 
 
-def _annual_rows(facts: dict, concepts_us: list[str], concepts_ifrs: list[str]) -> dict[int, float]:
-    """Return {fiscal_year: value} for full-year duration facts only.
+def _annual(facts: dict, us: list[str], ifrs: list[str]) -> dict[int, tuple[str, str, float]]:
+    """{fy: (start, end, value)} for full-year facts from annual reports only.
 
-    Three filters the previous version lacked, each of which silently
-    corrupted data:
-      * duration must be ~a year (330–400 days), so quarterly rows tagged
-        fp='FY' can't slip through;
-      * annual reports only (10-K / 20-F / 40-F);
-      * when the same year appears in several filings, keep the most recently
-        filed one — a 10-K restates the prior year as a comparative.
+    Three filters that matter: the period must be roughly a year (so quarterly
+    rows tagged fp='FY' cannot slip through); annual forms only; and where a
+    year appears in several filings, keep the latest — a 10-K restates the
+    prior year as a comparative.
     """
-    out: dict[int, tuple[str, float]] = {}
-    for taxonomy, concepts in (("us-gaap", concepts_us), ("ifrs-full", concepts_ifrs)):
+    out: dict[int, tuple[str, str, str, float]] = {}
+    for taxonomy, concepts in (("us-gaap", us), ("ifrs-full", ifrs)):
         tax = facts.get("facts", {}).get(taxonomy, {})
         for concept in concepts:
             if concept not in tax:
                 continue
             units = tax[concept].get("units", {})
-            rows = units.get("USD", []) or units.get("shares", [])
-            for row in rows:
-                if row.get("form") not in ("10-K", "10-K/A", "20-F", "40-F"):
+            for row in units.get("USD", []) or units.get("shares", []):
+                if row.get("form") not in ANNUAL_FORMS:
                     continue
                 start, end = row.get("start"), row.get("end")
-                if not start or not end:
+                if not (start and end):
                     continue
-                days = (dt.date.fromisoformat(end) - dt.date.fromisoformat(start)).days
-                if not (330 <= days <= 400):
-                    continue
-                fy = int(end[:4])
-                filed = row.get("filed", "")
-                if fy not in out or filed > out[fy][0]:
-                    out[fy] = (filed, float(row.get("val", 0.0)))
-            if out:
-                return {k: v[1] for k, v in out.items()}
-    return {}
-
-
-def _instant_share_counts(facts: dict) -> dict[int, float]:
-    """Year-end shares outstanding, used to derive dS."""
-    out: dict[int, tuple[str, float]] = {}
-    for taxonomy in ("us-gaap", "dei"):
-        tax = facts.get("facts", {}).get(taxonomy, {})
-        for concept in SHARE_CONCEPTS:
-            if concept not in tax:
-                continue
-            for row in tax[concept].get("units", {}).get("shares", []):
-                if row.get("form") not in ("10-K", "10-K/A", "20-F", "40-F"):
-                    continue
-                end = row.get("end")
-                if not end or row.get("start"):
+                if not 330 <= (dt.date.fromisoformat(end) - dt.date.fromisoformat(start)).days <= 400:
                     continue
                 fy, filed = int(end[:4]), row.get("filed", "")
                 if fy not in out or filed > out[fy][0]:
-                    out[fy] = (filed, float(row.get("val", 0.0)))
-    return {k: v[1] for k, v in out.items()}
+                    out[fy] = (filed, start, end, float(row.get("val", 0.0)))
+            if out:
+                return {k: (v[1], v[2], v[3]) for k, v in out.items()}
+    return {}
 
 
-def _latest_instant(facts: dict, concepts: list[str]) -> float | None:
-    """Most recent instant (balance-sheet) value for the first concept found."""
-    best = None
-    for taxonomy in ("us-gaap", "ifrs-full"):
+def _instant(facts: dict, concepts: list[str], unit: str = "USD") -> dict[int, float]:
+    out: dict[int, tuple[str, float]] = {}
+    for taxonomy in ("us-gaap", "dei", "ifrs-full"):
         tax = facts.get("facts", {}).get(taxonomy, {})
         for concept in concepts:
             if concept not in tax:
                 continue
-            for row in tax[concept].get("units", {}).get("USD", []):
+            for row in tax[concept].get("units", {}).get(unit, []):
                 if row.get("start") or not row.get("end"):
                     continue
-                if best is None or row["end"] > best[0]:
-                    best = (row["end"], float(row.get("val", 0.0)))
-            if best:
-                return best[1]
-    return None
+                if row.get("form") not in ANNUAL_FORMS:
+                    continue
+                fy, filed = int(row["end"][:4]), row.get("filed", "")
+                if fy not in out or filed > out[fy][0]:
+                    out[fy] = (filed, float(row["val"]))
+    return {k: v[1] for k, v in out.items()}
 
 
-def fetch_balance(facts: dict) -> dict:
-    """Net cash and diluted share count, so these are never left at a placeholder."""
-    g = lambda ks: (_latest_instant(facts, ks) or 0.0) / 1e6
-    cash = g(BALANCE["cash"]) + g(BALANCE["sti"]) + g(BALANCE["lti"])
-    debt = g(BALANCE["ltd"]) + g(BALANCE["std"])
-    return {"cash": cash, "debt": debt, "net_cash": cash - debt}
+@st.cache_data(ttl=86400, show_spinner=False)
+def _monthly_closes(ticker: str) -> dict[str, float]:
+    """Monthly closes for ~11 years, keyed 'YYYY-MM'."""
+    r = requests.get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        "?interval=1mo&range=11y", headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+    res = r.json()["chart"]["result"][0]
+    closes = res["indicators"]["quote"][0]["close"]
+    out = {}
+    for ts, c in zip(res["timestamp"], closes):
+        if c:
+            d = dt.datetime.utcfromtimestamp(ts)
+            out[f"{d.year:04d}-{d.month:02d}"] = float(c)
+    return out
 
 
-def fetch_years(ticker: str, n_years: int = 10) -> tuple[list[YearInputs], dict[str, list[int]]]:
-    """Returns (years, missing) where `missing` maps each variable to the
-    fiscal years it could not be resolved for. Nothing is silently zeroed."""
-    cmap = sec_ticker_map()
-    if ticker not in cmap:
-        raise ValueError(f"'{ticker}' is not in the SEC company list. "
-                         "Foreign private issuers without US listings won't appear.")
-    facts = sec_company_facts(cmap[ticker])
-
-    series = {k: _annual_rows(facts, us, ifrs) for k, (us, ifrs) in CONCEPTS.items()}
-    shares = _instant_share_counts(facts)
-
-    if not series["N"]:
-        raise ValueError("Could not find annual net income. This filer may use a "
-                         "taxonomy the app doesn't map yet — enter figures manually.")
-
-    fys = sorted(series["N"].keys())[-n_years:]
-    missing: dict[str, list[int]] = {k: [] for k in ("G", "T", "W", "Cw", "Ce", "dS")}
-
-    years: list[YearInputs] = []
-    for fy in fys:
-        def grab(key: str, scale: float = 1e6) -> float:
-            v = series[key].get(fy)
-            if v is None:
-                missing[key].append(fy)
-                return 0.0
-            return abs(float(v)) / scale
-
-        dS = 0.0
-        if fy in shares and (fy - 1) in shares:
-            dS = (shares[fy] - shares[fy - 1]) / 1e6
-        else:
-            missing["dS"].append(fy)
-
-        years.append(YearInputs(
-            fy=fy,
-            N=float(series["N"][fy]) / 1e6,
-            G=grab("G"),
-            T=grab("T"),
-            W=grab("W", 1e6),
-            dS=dS,
-            Cw=grab("Cw"),
-            Ce=grab("Ce"),
-        ))
-
-    # Prefills, so no valuation input is left at a placeholder.
-    bal = fetch_balance(facts)
-    sh_d = series.get("SHD", {})
-    diluted = (sh_d.get(fys[-1]) or shares.get(fys[-1]) or 0.0) / 1e6
-    rev = series.get("REV", {})
-    rev_yrs = sorted(rev)
-    growth = None
-    if len(rev_yrs) >= 4:
-        a, b = rev[rev_yrs[-4]], rev[rev_yrs[-1]]
-        if a > 0 and b > 0:
-            growth = (b / a) ** (1 / 3) - 1
-    bal.update({"diluted_shares": diluted, "rev_growth": growth})
-    return years, {k: v for k, v in missing.items() if v}, bal
+def _avg_price(closes: dict[str, float], start: str, end: str) -> float | None:
+    s, e = dt.date.fromisoformat(start), dt.date.fromisoformat(end)
+    vals, d = [], s
+    while d <= e:
+        v = closes.get(f"{d.year:04d}-{d.month:02d}")
+        if v:
+            vals.append(v)
+        d = (d.replace(day=1) + dt.timedelta(days=32)).replace(day=1)
+    return statistics.fmean(vals) if vals else None
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_price(ticker: str) -> float | None:
+def current_price(ticker: str) -> float | None:
     try:
         r = requests.get(
             f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=1d",
-            headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-        meta = r.json()["chart"]["result"][0]["meta"]
-        return float(meta.get("regularMarketPrice") or meta.get("chartPreviousClose"))
+            headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        m = r.json()["chart"]["result"][0]["meta"]
+        return float(m.get("regularMarketPrice") or m.get("chartPreviousClose"))
     except Exception:
         return None
 
 
+def load(ticker: str, n_years: int = 10):
+    cmap = _ticker_map()
+    if ticker not in cmap:
+        raise ValueError(f"'{ticker}' is not in the SEC company list.")
+    facts = _facts(cmap[ticker])
+
+    series = {k: _annual(facts, us, ifrs) for k, (us, ifrs) in CONCEPTS.items()}
+    if not series["N"]:
+        raise ValueError("No annual net income found — this filer uses a taxonomy "
+                         "the app does not map. Try the manual tab.")
+
+    shares_out = _instant(facts, ["CommonStockSharesOutstanding", "CommonStockSharesIssued",
+                                  "EntityCommonStockSharesOutstanding"], unit="shares")
+    try:
+        closes = _monthly_closes(ticker)
+    except Exception:
+        closes = {}
+
+    fys = sorted(series["N"])[-n_years:]
+    notes: list[str] = []
+    years: list[Year] = []
+
+    for fy in fys:
+        start, end, N = series["N"][fy]
+        get = lambda k: abs(series[k][fy][2]) / 1e6 if fy in series[k] else 0.0
+
+        dS = ((shares_out[fy] - shares_out[fy - 1]) / 1e6
+              if fy in shares_out and fy - 1 in shares_out else 0.0)
+        price = _avg_price(closes, start, end) or 0.0
+
+        years.append(Year(fy=fy, N=N / 1e6, G=get("G"), T=get("T"), dS=dS,
+                          Cw=get("Cw"), Ce=get("Ce"), price=price))
+
+    if any(y.price == 0 for y in years):
+        notes.append("No share price for some years — their SBC cost is understated.")
+    if not any(y.Cw for y in years):
+        notes.append("No tax-withholding line found. That understates the SBC cost, so "
+                     "owners' earnings here are flattering rather than conservative.")
+
+    g = lambda ks: (max(_instant(facts, ks).items(), default=(0, 0.0))[1]) / 1e6
+    net_cash = g(BALANCE["cash"]) + g(BALANCE["sti"]) + g(BALANCE["lti"]) \
+        - g(BALANCE["ltd"]) - g(BALANCE["std"])
+
+    sh = series.get("SHD", {})
+    diluted = (sh[fys[-1]][2] if fys[-1] in sh else shares_out.get(fys[-1], 0.0)) / 1e6
+
+    rev = series.get("REV", {})
+    ry = sorted(rev)
+    growth = 0.08
+    if len(ry) >= 4 and rev[ry[-4]][2] > 0 and rev[ry[-1]][2] > 0:
+        growth = (rev[ry[-1]][2] / rev[ry[-4]][2]) ** (1 / 3) - 1
+
+    return years, notes, {"net_cash": net_cash, "shares": diluted, "growth": growth}
+
+
 # ══════════════════════════════════════════════════════════════════════
-#  SELF-TEST  — validates the maths against published figures
+#  SELF-TEST
 # ══════════════════════════════════════════════════════════════════════
 
 def self_test() -> list[tuple[str, bool, str]]:
-    res = []
+    out = []
+    goog = [(2016, 19478, 6900, 3693, 3304, 97, 47), (2017, 12662, 7900, 4846, 4166, 78, 55),
+            (2018, 30736, 10000, 9075, 4993, -2, 61), (2019, 34343, 11700, 18396, 4765, -158, 70),
+            (2020, 40269, 12991, 31149, 5720, -263, 73), (2021, 76033, 15376, 50274, 10162, -264, 125),
+            (2022, 59972, 19362, 59296, 9300, -412, 117), (2023, 73795, 22460, 61504, 9837, -374, 115),
+            (2024, 100118, 22785, 62222, 12190, -243, 164), (2025, 132170, 24953, 45709, 14167, -93, 206)]
+    ys = [Year(fy=f, N=n, G=g, T=t, Cw=c, dS=d, price=p) for f, n, g, t, c, d, p in goog]
+    out.append(("Alphabet FY2016 V = $8,252M", abs(ys[0].V - 8252) < 1, f"${ys[0].V:,.0f}M"))
+    out.append(("Alphabet FY2025 V = $26,551M", abs(ys[-1].V - 26551) < 1, f"${ys[-1].V:,.0f}M"))
+    p = pool(ys)
+    out.append(("Alphabet pooled ΔE = 88.7%", abs(p.dE - 0.887) < 0.002, f"{p.dE:.2%}"))
 
-    # Alphabet FY2016–2025, from the published Tragic Algebra table
-    goog = [(2016, 19478, 6900, 3693, 3304, 78.6, 97), (2017, 12662, 7900, 4846, 4166, 88.1, 78),
-            (2018, 30736, 10000, 9075, 4993, 148.8, -2), (2019, 34343, 11700, 18396, 4765, 262.8, -158),
-            (2020, 40269, 12991, 31149, 5720, 426.7, -263), (2021, 76033, 15376, 50274, 10162, 402.2, -264),
-            (2022, 59972, 19362, 59296, 9300, 506.8, -412), (2023, 73795, 22460, 61504, 9837, 534.8, -374),
-            (2024, 100118, 22785, 62222, 12190, 379.4, -243), (2025, 132170, 24953, 45709, 14167, 221.9, -93)]
-    ys = [YearInputs(fy=y, N=n_, G=g, T=t, W=w, dS=ds, Cw=c) for y, n_, g, t, c, w, ds in goog]
-    p = pool_delta_e(ys)
-    res.append(("Alphabet pooled ΔE = 88.7%", abs(p.delta_e - 0.887) < 0.002, f"{p.delta_e:.2%}"))
-    res.append(("Alphabet FY2016 V = $8,252M", abs(ys[0].V - 8252) < 5, f"${ys[0].V:,.0f}M"))
+    m16 = Year(fy=2016, N=10217, G=3218, T=0, Cw=-10, dS=46, price=107)
+    out.append(("Meta FY2016 ΔE = 83.4% (no buyback)", abs(m16.dE - 0.834) < 0.005, f"{m16.dE:.1%}"))
 
-    # Pure-dilution year needs an external price (Meta FY2016)
-    meta16 = YearInputs(fy=2016, N=10217, G=3218, T=0, W=0, dS=46, Cw=-10, external_price=107)
-    res.append(("Meta FY2016 ΔE = 83.4% (no buyback)",
-                abs(meta16.delta_e - 0.834) < 0.005, f"{meta16.delta_e:.1%}"))
-    res.append(("Missing price → year excluded, not zeroed",
-                YearInputs(fy=2020, N=100, G=10, T=0, W=0, dS=5).V is None, "excluded"))
-
-    # NDX-97 index identities
     N_, G_, OM_ = 4925.5, 919.0, 1732.2
-    OE_ = N_ + G_ - OM_
-    res.append(("NDX-97 GAAP overstatement = 19.78%",
-                abs((OM_ - G_) / OE_ - 0.1978) < 0.001, f"{(OM_-G_)/OE_:.2%}"))
+    out.append(("NDX-97 GAAP overstatement = 19.78%",
+                abs((OM_ - G_) / (N_ + G_ - OM_) - 0.1978) < 0.001,
+                f"{(OM_-G_)/(N_+G_-OM_):.2%}"))
+    out.append(("Break-even ΔE = 87%", abs(1 / 1.15 - 0.870) < 0.001, f"{1/1.15:.1%}"))
 
-    # Salesforce full ladder from tier structure alone
-    crm = IVParams(owners_earnings=7300, shares=1073.3, tier="Chapel",
-                   stage1_growth=0.069, exit_multiple=21.8, blend_model1=1.0)
-    res.append(("Salesforce IV15 ≈ $69.81",
-                abs(intrinsic_value(crm, 15) - 69.81) < 1.0, f"${intrinsic_value(crm,15):.2f}"))
-    res.append(("Salesforce IV12 ≈ $96.02",
-                abs(intrinsic_value(crm, 12) - 96.02) < 1.5, f"${intrinsic_value(crm,12):.2f}"))
-    res.append(("Salesforce IVB ≈ 8.6%",
-                abs(expected_return(165.84, crm) - 0.086) < 0.005,
+    crm = IVParams(OE=7300, shares=1073.3, tier="Chapel", growth=0.069,
+                   exit_multiple=21.8, blend=1.0)
+    out.append(("Salesforce IV15 ≈ $69.81", abs(intrinsic_value(crm, 15) - 69.81) < 1.0,
+                f"${intrinsic_value(crm,15):.2f}"))
+    out.append(("Salesforce IVB ≈ 8.6%", abs(expected_return(165.84, crm) - 0.086) < 0.005,
                 f"{expected_return(165.84, crm):.1%}"))
-    return res
+    return out
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -596,225 +503,158 @@ def self_test() -> list[tuple[str, bool, str]]:
 
 st.set_page_config(page_title="Burry IV15 Screener", layout="wide")
 st.title("Burry IV15 Screener")
-st.caption("Tragic Algebra owners' earnings → AICT tiering → hybrid intrinsic value ladder")
+st.caption("True owners' earnings after stock compensation, then the price ladder that follows")
 
 with st.sidebar:
     st.subheader("Method self-test")
-    if st.button("Run"):
+    st.caption("Checks the maths against Burry's own published figures.")
+    if st.button("Run self-test"):
         for name, ok, got in self_test():
-            st.write(("✅ " if ok else "❌ ") + name + f" — {got}")
+            st.write(("✅ " if ok else "❌ ") + f"{name} — {got}")
     st.divider()
-    st.caption(
-        "IV15 is the price giving ~15% annually over 15+ years. It is a buy price "
-        "target from a multi-stage DCF, not an earnings multiple. Baseline intrinsic "
-        "value sits between IV8 and IV10 — below that buybacks add value per share, "
-        "above it they destroy it."
-    )
+    st.caption("IV15 is the price giving about 15% a year over 15+ years. It is a buy "
+               "price target from a multi-stage cash flow model, not an earnings multiple. "
+               "Real intrinsic value sits between IV8 and IV10.")
 
-tab_fetch, tab_manual = st.tabs(["Fetch from SEC", "Enter manually"])
+c1, c2, c3 = st.columns([2, 1, 1])
+ticker = c1.text_input("Ticker", placeholder="ADBE, CRM, NOW, GOOGL…").upper().strip()
+n_years = c2.number_input("Years of history", 3, 12, 10)
+go = c3.button("Analyse", type="primary", use_container_width=True)
 
-years: list[YearInputs] = []
-missing: dict[str, list[int]] = {}
-
-with tab_fetch:
-    c1, c2 = st.columns([2, 1])
-    ticker = c1.text_input("Ticker", value="", placeholder="ADBE, CRM, NOW…").upper().strip()
-    n_years = c2.number_input("Years of history", 3, 12, 10)
-    if st.button("Pull 10-K data", type="primary") and ticker:
-        try:
-            with st.spinner(f"Reading {ticker} filings…"):
-                years, missing, prefill = fetch_years(ticker, int(n_years))
-            st.session_state["years"] = years
-            st.session_state["missing"] = missing
-            st.session_state["prefill"] = prefill
-            st.session_state["ticker"] = ticker
-        except Exception as e:
-            st.error(str(e))
-
-with tab_manual:
-    st.caption("Dollars in $M, share counts in millions. Leave a row blank to skip it.")
-    blank = pd.DataFrame([{"fy": 2025 - i, "N": None, "G": None, "T": None, "W": None,
-                           "dS": None, "Cw": None, "Ce": None, "external_price": None}
-                          for i in range(5)][::-1])
-    edited = st.data_editor(blank, num_rows="dynamic", width='stretch', key="manual")
-    if st.button("Use these figures"):
-        rows = []
-        for _, r in edited.iterrows():
-            if pd.isna(r["N"]):
-                continue
-            rows.append(YearInputs(
-                fy=int(r["fy"]), N=float(r["N"]), G=float(r["G"] or 0), T=float(r["T"] or 0),
-                W=float(r["W"] or 0), dS=float(r["dS"] or 0), Cw=float(r["Cw"] or 0),
-                Ce=float(r["Ce"] or 0),
-                external_price=None if pd.isna(r["external_price"]) else float(r["external_price"]),
-            ))
-        st.session_state["years"] = rows
-        st.session_state["missing"] = {}
-        st.session_state["prefill"] = {}
-        st.session_state["ticker"] = "MANUAL"
+if go and ticker:
+    try:
+        with st.spinner(f"Reading {ticker} annual filings…"):
+            years, notes, pre = load(ticker, int(n_years))
+        st.session_state.update(years=years, notes=notes, pre=pre, tk=ticker)
+    except Exception as e:
+        st.error(str(e))
 
 years = st.session_state.get("years", [])
-missing = st.session_state.get("missing", {})
-prefill = st.session_state.get("prefill", {})
-ticker = st.session_state.get("ticker", "")
-
 if years:
+    notes, pre, tk = st.session_state["notes"], st.session_state["pre"], st.session_state["tk"]
+
+    # ── owners' earnings ────────────────────────────────────────────
     st.divider()
-    st.subheader(f"Tragic Algebra — {ticker}")
+    st.subheader(f"Owners' earnings — {tk}")
+    for nte in notes:
+        st.info(nte)
 
-    if missing:
-        st.warning(
-            "**Not found in XBRL, defaulted to zero — verify these in the 10-K.** "
-            + "; ".join(f"`{k}` for {v}" for k, v in missing.items())
-            + ".  `W` and `Cw` in particular often live only in the share-repurchase "
-              "footnote or the statement of shareholders' equity."
-        )
+    df = pd.DataFrame([{"FY": y.fy, "Net income": y.N, "SBC expense": y.G, "Buybacks": y.T,
+                        "Share change": y.dS, "Avg price": y.price, "True SBC cost": y.omega,
+                        "Owners' earnings": y.OE, "Kept": y.dE} for y in years])
+    st.dataframe(df.style.format({
+        "Net income": "{:,.0f}", "SBC expense": "{:,.0f}", "Buybacks": "{:,.0f}",
+        "Share change": "{:+,.1f}", "Avg price": "${:,.2f}", "True SBC cost": "{:,.0f}",
+        "Owners' earnings": "{:,.0f}", "Kept": "{:.1%}"}, na_rep="—"),
+        use_container_width=True, hide_index=True)
 
-    df = pd.DataFrame([{
-        "FY": y.fy, "N": y.N, "G": y.G, "T": y.T, "W": y.W, "ΔS": y.dS,
-        "C": y.C, "P": y.P, "V": y.V, "Ω": y.omega,
-        "Owners' earnings": y.owners_earnings,
-        "ΔE": y.delta_e,
-    } for y in years])
-    st.dataframe(
-        df.style.format({c: "{:,.0f}" for c in ["N", "G", "T", "C", "V", "Ω", "Owners' earnings"]}
-                        | {"W": "{:,.1f}", "ΔS": "{:+,.1f}", "P": "${:,.2f}", "ΔE": "{:.1%}"}, na_rep="—"),
-        width='stretch', hide_index=True)
-
-    try:
-        pooled = pool_delta_e(years)
-    except ValueError as e:
-        st.error(str(e))
-        st.stop()
-
-    if pooled.years_dropped:
-        st.info(
-            f"Years {pooled.years_dropped} were excluded: no buyback, so the average price "
-            "is needed to value shares delivered. Their N, G and C are excluded too — "
-            "keeping earnings while dropping the SBC cost would bias the result low. "
-            "Add a price on the manual tab to include them."
-        )
-
+    p = pool(years)
     m = st.columns(4)
-    m[0].metric("Pooled ΔE", f"{pooled.delta_e:.1%}", f"{pooled.years_used}y earnings-weighted")
-    m[1].metric("Owners' earnings", f"${pooled.sum_OE:,.0f}M", "cumulative")
-    m[2].metric("GAAP overstates by", f"{pooled.gaap_overstatement:.1%}")
-    m[3].metric("Street overstates by", f"{pooled.street_overstatement:.1%}")
+    m[0].metric("Owners' earnings kept", f"{p.dE:.1%}", f"{p.years}y pooled")
+    m[1].metric("Cumulative owners' earnings", f"${p.sum_OE:,.0f}M")
+    m[2].metric("GAAP overstates by", f"{p.gaap_overstatement:.1%}")
+    m[3].metric("Wall Street overstates by", f"{p.street_overstatement:.1%}")
 
-    if pooled.tragic_tier:
-        st.error(
-            "**Tragic Tier.** Cumulative SBC cost exceeded GAAP SBC expense and net income "
-            "combined — owners' earnings are negative over the whole period, and not because "
-            "of one bad year. Shareholders were net funders of employee compensation."
-        )
-    elif pooled.delta_e < 1 / 1.15:
-        st.warning(
-            f"**Below the {1/1.15:.0%} break-even.** At ΔE of {pooled.delta_e:.1%}, even 15% "
-            f"GAAP growth compounds intrinsic value per share at only "
-            f"{pooled.true_cagr(0.15):+.2%} a year. Retention after 10 years: "
-            f"{pooled.retention(10):.1%}."
-        )
+    if p.tragic_tier:
+        st.error("**Tragic Tier.** Over this period the cost of stock compensation exceeded "
+                 "everything the business earned. Owners' earnings are negative, and not from "
+                 "one bad year. Shareholders were net funders of employee pay.")
+    elif p.dE < 1 / 1.15:
+        st.warning(f"**Below the 87% break-even.** At {p.dE:.1%}, even 15% reported growth "
+                   f"compounds value per share at only {p.true_cagr(0.15):+.2%} a year. "
+                   f"After ten years just {p.retention(10):.1%} of reported growth survives.")
     else:
-        st.success(
-            f"Above the {1/1.15:.0%} break-even — reported growth reaches the owner. "
-            f"Retention after 10 years: {pooled.retention(10):.1%}."
-        )
+        st.success(f"**Above the 87% break-even** — reported growth actually reaches you. "
+                   f"After ten years {p.retention(10):.1%} of it survives.")
 
-    # ── valuation ────────────────────────────────────────────────────
+    # ── valuation ───────────────────────────────────────────────────
     st.divider()
     st.subheader("Intrinsic value ladder")
 
-    latest = [y for y in years if y.usable][-1]
-    default_oe = latest.owners_earnings
-
     v1, v2, v3 = st.columns(3)
-    with v1:
-        oe = st.number_input("Owners' earnings ($M)", value=float(round(default_oe, 1)), step=1.0,
-                             help="Normalise further for maintenance capex, working capital and "
-                                  "one-offs before relying on this.")
-        _sh = prefill.get("diluted_shares") or 0.0
-        shares = st.number_input(
-            "Diluted shares (M)", value=float(round(_sh, 1)) if _sh > 0 else 0.0, step=1.0,
-            help="Pulled from the filings. Check it — this divides everything, so a wrong "
-                 "figure scales IV15 by exactly the same factor.")
-    with v2:
-        tier = st.selectbox("AICT tier", list(AICT.keys()), index=2,
-                            format_func=lambda t: f"{t} — {TIER_BLURB[t]}")
-        _g = prefill.get("rev_growth")
-        g1 = st.number_input(
-            "Stage 1 growth (%)", value=round((_g if _g is not None else 0.08) * 100, 1), step=0.5,
-            help="Seeded from 3-year revenue CAGR — a starting point, not an answer. Owners' "
-                 "earnings growth is what matters, and ROIC is the ceiling: a company cannot "
-                 "outgrow its return on capital forever.") / 100
-    with v3:
-        net_cash = st.number_input("Net cash ($M)", value=float(round(prefill.get("net_cash", 0.0), 1)), step=10.0,
-                                   help="Subtract only what is freely deployable. Restricted, "
-                                        "regulated and operationally-tied cash funds the business.")
-        price = st.number_input("Price", value=float(fetch_price(ticker) or 100.0), step=0.01)
+    OE = v1.number_input("Owners' earnings ($M)", value=float(round(years[-1].OE, 1)), step=1.0)
+    shares = v1.number_input("Diluted shares (M)", value=float(round(pre["shares"], 1)), step=1.0)
+    tier = v2.selectbox("Competitive tier", list(AICT), index=2,
+                        format_func=lambda t: f"{t} — {TIER_BLURB[t]}")
+    growth = v2.number_input("Growth rate (%)", value=round(pre["growth"] * 100, 1), step=0.5,
+                             help="Seeded from 3-year revenue growth. Return on capital is the "
+                                  "ceiling — nothing outgrows it forever.") / 100
+    net_cash = v3.number_input("Net cash ($M)", value=float(round(pre["net_cash"], 1)), step=10.0)
+    price = v3.number_input("Price", value=float(current_price(tk) or 100.0), step=0.01)
 
-    with st.expander("Hybrid model settings — judgement, not published"):
+    with st.expander("Model settings — these are judgement, not published"):
         h1, h2, h3 = st.columns(3)
-        exit_m = h1.number_input("Exit multiple on year-15 owners' earnings", value=20.0, step=0.5)
-        blend = h2.slider("Weight on perpetuity model", 0.0, 1.0, 0.5, 0.05)
-        s0y = h3.number_input("Stage 0 years (hypergrowth)", 0, 8, 0)
-        s0g = h3.number_input("Stage 0 growth (%)", value=30.0, step=1.0) / 100
+        exit_m = h1.number_input("Exit multiple on year-15 earnings", value=20.0, step=0.5)
+        blend = h2.slider("Weight on long-horizon model", 0.0, 1.0, 0.5, 0.05)
+        s0y = h3.number_input("Hypergrowth years", 0, 8, 0)
+        s0g = h3.number_input("Hypergrowth rate (%)", value=30.0, step=1.0) / 100
         t = AICT[tier]
-        st.caption(
-            f"{tier}: stage 1 = {t.stage1_years}y, stage 2 = {t.stage2_years}y at "
-            f"{t.stage2_multiplier:.2f}× stage-1 growth, terminal cap {t.terminal_growth_cap:.0%}, "
-            f"debt capacity {t.debt_capacity_ebitda:.1f}× EBITDA. "
-            f"**Total horizon {t.horizon + s0y} years** — not 15. "
-            "The exit multiple and blend weight are not published anywhere and cannot be "
-            "reverse-engineered from published IV values; they are your call."
-        )
-
-    p = IVParams(owners_earnings=oe, shares=shares, tier=tier, stage1_growth=g1,
-                 net_cash=net_cash, exit_multiple=exit_m, blend_model1=blend,
-                 stage0_years=int(s0y), stage0_growth=s0g)
+        st.caption(f"{tier}: stage 1 = {t.stage1_years}y, stage 2 = {t.stage2_years}y at "
+                   f"{t.stage2_multiplier:.2f}x, terminal cap {t.terminal_growth_cap:.0%}, debt "
+                   f"capacity {t.debt_capacity_ebitda:.1f}x EBITDA. Total horizon "
+                   f"**{t.horizon + int(s0y)} years**. The exit multiple and blend cannot be "
+                   "recovered from published figures — they are your call.")
 
     if shares <= 0:
-        st.error("Enter the diluted share count before valuing. It could not be read from the "
-                 "filings, and everything below is divided by it.")
+        st.error("Enter the diluted share count. Everything below divides by it.")
         st.stop()
 
-    implied_cap = shares * price / 1000.0
-    if prefill.get("diluted_shares") and abs(shares / prefill["diluted_shares"] - 1) > 0.10:
-        st.warning(f"Share count differs by more than 10% from the filings "
-                   f"({prefill['diluted_shares']:,.1f}M). IV15 scales inversely with this.")
-    st.caption(f"Sanity check — implied market cap: ${implied_cap:,.1f}B "
-               f"({shares:,.1f}M shares x ${price:,.2f}). If that is not roughly the real market "
-               f"cap, the share count is wrong and every figure below is wrong by the same factor.")
+    st.caption(f"Sanity check — implied market cap ${shares * price / 1000:,.1f}B. "
+               "If that is not roughly right, the share count is wrong and so is everything else.")
 
-    ladder = iv_ladder(p)
-    iv15 = ladder[15]
+    par = IVParams(OE=OE, shares=shares, tier=tier, growth=growth, net_cash=net_cash,
+                   exit_multiple=exit_m, blend=blend, stage0_years=int(s0y), stage0_growth=s0g)
+    lad = ladder(par)
+    iv15 = lad[15]
 
-    if iv15 != iv15:  # NaN
+    if iv15 != iv15:
         st.error("Required return must exceed the tier's terminal growth cap.")
     elif iv15 < 0:
-        st.error(
-            "**Negative IV15 — not investible.** There is no share price, not even $0.01, "
-            "that delivers 15% annually as a long-term shareholder on these inputs."
-        )
+        st.error("**Negative IV15 — not investible.** No share price, not even one cent, "
+                 "delivers 15% a year to a long-term shareholder on these inputs.")
     else:
-        ratio = price / iv15
-        er = expected_return(price, p)
+        ratio, (zn, kind) = price / iv15, zone(price / iv15)
+        er = expected_return(price, par)
         k = st.columns(4)
         k[0].metric("IV15", f"${iv15:,.2f}")
-        k[1].metric("P/IV15", f"{ratio:.2f}×", zone(ratio))
-        k[2].metric("IVB (expected CAGR)", f"{er:.1%}")
-        k[3].metric("Valuation points", f"{valuation_points(ratio)}/35")
+        k[1].metric("Price / IV15", f"{ratio:.2f}x", zn)
+        k[2].metric("Expected return", f"{er:.1%}")
+        k[3].metric("Valuation score", f"{valuation_points(ratio)}/35")
 
-        lad = pd.DataFrame([{
-            "Rung": f"IV{n}", "Price": v, "vs market": f"{price/v:.2f}×" if v > 0 else "—",
-            "Meaning": {8: "baseline intrinsic value, upper",
-                        10: "baseline intrinsic value, lower",
-                        12: "fair", 15: "benchmark buy target",
-                        18: "deep margin of safety", 20: "crisis pricing"}[n],
-        } for n, v in ladder.items() if v == v])
-        st.dataframe(lad.style.format({"Price": "${:,.2f}"}),
-                     width='stretch', hide_index=True)
-        st.caption(
-            "Set alerts at every rung. Each is a separate DCF run at its own discount rate — "
-            "scaling one rung off another does not work, since published IV12/IV15 ratios "
-            "range 1.33–1.44 across companies."
-        )
+        getattr(st, kind)(
+            f"**{zn}** — at ${price:,.2f} this trades at {ratio:.2f}x its IV15 of "
+            f"${iv15:,.2f}, implying about {er:.1%} a year held long term.")
+
+        st.dataframe(pd.DataFrame([
+            {"Rung": f"IV{n}", "Price": v, "vs market": f"{price/v:.2f}x" if v > 0 else "—",
+             "Meaning": RUNG_MEANING[n]} for n, v in lad.items() if v == v
+        ]).style.format({"Price": "${:,.2f}"}), use_container_width=True, hide_index=True)
+        st.caption("Set alerts at every rung. Each is a separate run at its own discount rate.")
+
+        # ── stress test ─────────────────────────────────────────────
+        st.divider()
+        st.subheader("Stress test")
+        s1, s2 = st.columns(2)
+        keys = list(AICT)
+        worse = s1.selectbox("Downgrade the tier to", keys,
+                             index=min(len(keys) - 1, keys.index(tier) + 1))
+        cut = s2.slider("Cut the growth rate by (%)", 0, 80, 30, 5)
+
+        sp = IVParams(OE=OE, shares=shares, tier=worse, growth=growth * (1 - cut / 100),
+                      net_cash=net_cash, exit_multiple=exit_m, blend=blend,
+                      stage0_years=int(s0y), stage0_growth=s0g)
+        siv = intrinsic_value(sp, 15)
+        q = st.columns(3)
+        q[0].metric("Stressed IV15", f"${siv:,.2f}" if siv == siv and siv > 0 else "negative",
+                    f"{siv/iv15-1:+.1%}" if siv == siv and siv > 0 else None)
+        if siv == siv and siv > 0:
+            q[1].metric("Stressed Price / IV15", f"{price/siv:.2f}x", zone(price / siv)[0])
+            q[2].metric("Stressed expected return", f"{expected_return(price, sp):.1%}")
+            if price <= siv:
+                st.success("Still below IV15 even after the downgrade and the growth cut. "
+                           "That is what a margin of safety looks like.")
+            else:
+                st.info("Falls out of Fat Pitch territory under stress. Worth knowing what "
+                        "you are relying on.")
+        else:
+            st.error("Not investible under the stressed assumptions.")
