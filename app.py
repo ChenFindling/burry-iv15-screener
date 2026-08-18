@@ -62,6 +62,14 @@ class Tier:
     def horizon(self) -> int:
         return self.stage1_years + self.stage2_years
 
+    @property
+    def default_exit_multiple(self) -> float:
+        """(1+g)/(r-g) at r=15%, i.e. the multiple the tier's own terminal
+        growth cap already implies. Internally consistent rather than invented,
+        and a far better starting point than one number for every tier — a
+        Stone business in decline should never inherit a Fortress multiple."""
+        return (1 + self.terminal_growth_cap) / (0.15 - self.terminal_growth_cap)
+
 
 AICT: dict[str, Tier] = {
     "Fortress": Tier(8, 16, 0.70, 0.07, 3.0),
@@ -568,9 +576,20 @@ if years and ticker and st.session_state.get("tk") == ticker:
                      help="The long window is the diagnostic. Where capital policy has changed, "
                           "the recent regime is what will actually apply going forward.")
     use_dE = recent.dE if which.startswith("Last 3") else pooled.dE
-    derived_OE = fwd_N * use_dE
+    dE_usable = 0.0 < use_dE <= 1.25
+    derived_OE = fwd_N * use_dE if dE_usable else float(round(years[-1].OE, 1))
     f3.metric("Implied Forward OE", f"${derived_OE:,.0f}M",
-              f"{fwd_N:,.0f} x {use_dE:.1%}")
+              f"{fwd_N:,.0f} x {use_dE:.1%}" if dE_usable else "ΔE unusable — set OE by hand")
+
+    if not dE_usable:
+        st.error(
+            f"⛔ **ΔE of {use_dE:.1%} cannot be projected forward.** A negative or absurd ratio "
+            "means stock compensation has swamped earnings over this window, so multiplying it "
+            "by next year's profit is meaningless. Burry handles these by estimating recurring "
+            "owners' earnings directly — DocuSign is his clearest example: ΔE of roughly −950%, "
+            "yet he still assigns about $195M of forward owners' earnings on judgement. "
+            "**Enter your own figure in Base Owners' Earnings below.** The other window may help."
+        )
 
     if regime_gap > 0.15:
         st.warning(f"⚠️ **Regime change:** ΔE was {pooled.dE:.1%} over {pooled.years} years but "
@@ -591,9 +610,11 @@ if years and ticker and st.session_state.get("tk") == ticker:
     with a2:
         shares = st.number_input("Diluted Shares (M)",
                                  value=float(round(pre["shares"], 1)), step=1.0)
-        exit_m = st.number_input("Exit Multiple (M15)", value=20.0, step=0.5,
-                                 help="Multiple applied to year-15 owners' earnings. Burry has "
-                                      "never published these — your judgement.")
+        exit_m = st.number_input(
+            "Exit Multiple (M15)", value=round(AICT[tier_name].default_exit_multiple, 2), step=0.5,
+            help="Multiple applied to year-15 owners' earnings. Defaults to the multiple this "
+                 "tier's own terminal growth cap implies at 15%. Burry has never published his, "
+                 "so raise it for genuinely durable businesses and cut it for fading ones.")
     with a3:
         net_cash = st.number_input("Net Cash ($M)",
                                    value=float(round(pre["net_cash"], 1)), step=10.0)
@@ -604,6 +625,14 @@ if years and ticker and st.session_state.get("tk") == ticker:
 
     for nte in notes:
         st.caption("ℹ️ " + nte)
+
+    if net_cash and shares > 0:
+        _p = current_price(tk) or 0.0
+        if _p > 0 and abs(net_cash / (shares * _p)) > 0.08:
+            st.info(f"💰 Net cash of ${net_cash:,.0f}M is {net_cash/(shares*_p):.0%} of market cap "
+                    f"— about ${net_cash/shares:,.2f} per share of the IV15 below. Subtract only "
+                    "what is freely deployable: restricted, regulated and operationally-tied "
+                    "cash (customer float especially) funds the business and belongs in it.")
 
     # ── 2. tragic algebra ───────────────────────────────────────────
     st.markdown("---")
