@@ -69,7 +69,6 @@ def extract_dynamic_growth_rate(facts_tree):
                 units = us_facts[concept].get("units", {}).get("USD", [])
                 fy_rows = [r for r in units if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
                 if len(fy_rows) >= 2:
-                    # Sort chronologically to get the latest 2 years
                     fy_rows.sort(key=lambda x: x.get("end", ""))
                     v_latest = float(fy_rows[-1].get("val", 0.0))
                     v_prev = float(fy_rows[-2].get("val", 0.0))
@@ -91,22 +90,50 @@ def fetch_sec_data(symbol):
     
     facts = res.json()
 
-    # 1. Income & SBC (Audited Full Year 10-K)
-    N_val = get_xbrl_annual_val(facts, ["NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLoss", "ProfitLoss"])
-    G_val = get_xbrl_annual_val(facts, ["AllocatedShareBasedCompensationExpense", "ShareBasedCompensation", "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense"])
-    T_val = get_xbrl_annual_val(facts, ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity", "PaymentsRelatedToTaxWithholdingForShareBasedCompensation"])
+    # 1. Income & SBC (Broadened GAAP tags across all parent consolidation structures)
+    N_val = get_xbrl_annual_val(facts, [
+        "NetIncomeLoss", 
+        "NetIncomeLossAvailableToCommonStockholdersBasic", 
+        "ProfitLoss",
+        "NetIncomeLossAllocatedToGeneralPartners",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"
+    ])
+    G_val = get_xbrl_annual_val(facts, [
+        "AllocatedShareBasedCompensationExpense", 
+        "ShareBasedCompensation", 
+        "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense",
+        "ShareBasedCompensationArrangementsByShareBasedPaymentAwardCompensationExpense"
+    ])
+    T_val = get_xbrl_annual_val(facts, [
+        "PaymentsForRepurchaseOfCommonStock", 
+        "PaymentsForRepurchaseOfEquity", 
+        "PaymentsRelatedToTaxWithholdingForShareBasedCompensation",
+        "PaymentsForRepurchaseOfOtherEquity"
+    ])
 
     # 2. Balance Sheet Cash & Marketable Securities
-    cash_val = get_xbrl_instant_val(facts, ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"])
-    st_inv_val = get_xbrl_instant_val(facts, ["MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesCurrent", "OtherShortTermInvestments"])
+    cash_val = get_xbrl_instant_val(facts, [
+        "CashAndCashEquivalentsAtCarryingValue", 
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        "CashAndDueFromBanks"
+    ])
+    st_inv_val = get_xbrl_instant_val(facts, [
+        "MarketableSecuritiesCurrent", 
+        "AvailableForSaleSecuritiesCurrent", 
+        "OtherShortTermInvestments",
+        "MarketableSecurities"
+    ])
 
     # 3. Funded Corporate Debt
-    lt_debt = get_xbrl_instant_val(facts, ["LongTermDebtNoncurrent", "LongTermDebt"])
+    lt_debt = get_xbrl_instant_val(facts, ["LongTermDebtNoncurrent", "LongTermDebt", "SeniorNotes"])
     st_debt = get_xbrl_instant_val(facts, ["DebtCurrent", "ShortTermBorrowings", "CommercialPaper"])
     total_debt_val = lt_debt + st_debt
 
     # 4. Diluted Share Count
-    shares_val = get_xbrl_annual_val(facts, ["WeightedAverageNumberOfDilutedSharesOutstanding", "WeightedAverageNumberOfSharesOutstandingDiluted"])
+    shares_val = get_xbrl_annual_val(facts, [
+        "WeightedAverageNumberOfDilutedSharesOutstanding", 
+        "WeightedAverageNumberOfSharesOutstandingDiluted"
+    ])
     if shares_val == 0.0:
         shares_val = get_xbrl_instant_val(facts, ["EntityCommonStockSharesOutstanding"], taxonomy="dei")
     if shares_val == 0.0:
@@ -127,7 +154,7 @@ def fetch_sec_data(symbol):
     return {
         "ticker": symbol,
         "price": price_val,
-        "shares": (shares_val / 1e6) if shares_val > 0 else 58.0,
+        "shares": (shares_val / 1e6) if shares_val > 0 else 100.0,
         "N": N_val / 1e6,
         "G": G_val / 1e6,
         "T": abs(T_val) / 1e6,
@@ -137,7 +164,7 @@ def fetch_sec_data(symbol):
     }
 
 # Search Bar
-ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ADBE, CRM, GOOGL, ADSK, PAYC").upper().strip()
+ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ADBE, NOW, CRM, GOOGL, PAYC").upper().strip()
 tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=2)
 tier = AICT_TIERS[tier_name]
 
