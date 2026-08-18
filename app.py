@@ -110,24 +110,22 @@ def fetch_sec_data(symbol):
         "PaymentsForRepurchaseOfOtherEquity"
     ])
 
-    # 2. Cash & Liquid Investments
+    # 2. Strict Balance Sheet Cash (Cash & Pure Marketable Securities only)
     cash_val = get_xbrl_instant_val(facts, [
         "CashAndCashEquivalentsAtCarryingValue", 
-        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
-        "CashAndDueFromBanks"
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"
     ])
     st_inv_val = get_xbrl_instant_val(facts, [
         "MarketableSecuritiesCurrent", 
-        "AvailableForSaleSecuritiesCurrent", 
-        "OtherShortTermInvestments",
-        "MarketableSecurities"
+        "AvailableForSaleSecuritiesCurrent"
     ])
 
-    # 3. Funded Corporate Debt & Notes
+    # 3. Funded Corporate Debt (Strict Senior Notes, Bonds, Credit Facilities)
     lt_debt = get_xbrl_instant_val(facts, [
         "LongTermDebtNoncurrent", 
-        "LongTermDebt", 
+        "LongTermDebtAndCapitalLeaseObligations", 
         "SeniorNotes",
+        "LongTermDebt",
         "ConvertibleDebtNoncurrent",
         "NotesPayableNoncurrent"
     ])
@@ -135,6 +133,7 @@ def fetch_sec_data(symbol):
         "DebtCurrent", 
         "ShortTermBorrowings", 
         "CommercialPaper",
+        "LongTermDebtCurrent",
         "LinesOfCreditCurrent",
         "NotesPayableCurrent"
     ])
@@ -175,7 +174,7 @@ def fetch_sec_data(symbol):
     }
 
 # Search Bar
-ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. CRDO, ADBE, NOW, CRM, GOOGL").upper().strip()
+ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ORCL, ADBE, NOW, CRM, GOOGL, CRDO").upper().strip()
 tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=2)
 tier = AICT_TIERS[tier_name]
 
