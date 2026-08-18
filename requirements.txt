@@ -1,4 +1,4 @@
 streamlit
-yfinance
+requests
 pandas
 numpy
