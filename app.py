@@ -6,7 +6,7 @@ import numpy as np
 st.set_page_config(page_title="Burry IV15 Screener", layout="centered")
 
 st.title("🎯 Burry IV15 Value Screener")
-st.caption("Automated SEC EDGAR Audited Financials & AICT Moat Valuation Engine")
+st.caption("Michael Burry's True Owners' Earnings (OE) & AICT Moat Stress-Testing Engine")
 
 # 1. AICT Moat Tier Rules
 AICT_TIERS = {
@@ -24,7 +24,6 @@ SEC_HEADERS = {
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_sec_ticker_mapping():
-    """Maps Tickers to SEC 10-digit CIK numbers."""
     url = "https://www.sec.gov/files/company_tickers.json"
     res = requests.get(url, headers=SEC_HEADERS, timeout=10)
     data = res.json()
@@ -34,34 +33,24 @@ def get_sec_ticker_mapping():
     return mapping
 
 def extract_latest_xbrl_facts(facts_json, concept_names, taxonomy="us-gaap", is_duration=False):
-    """
-    Extracts the most recent 10-K or 10-Q reported value across matching XBRL concepts.
-    If is_duration=True, prefers full-year (10-K) numbers for flow metrics (Income, SBC, Buybacks).
-    """
     if "facts" not in facts_json or taxonomy not in facts_json["facts"]:
         return 0.0
-    
     for concept in concept_names:
         if concept in facts_json["facts"][taxonomy]:
             units = facts_json["facts"][taxonomy][concept].get("units", {})
             values = units.get("USD", units.get("shares", []))
-            
             if is_duration:
-                # Prefer full-year 10-K filings for Income/Cash Flow items
                 reports = [v for v in values if v.get("form") in ["10-K", "10-K/A"] and v.get("fp") in ["FY", "CY"]]
                 if not reports:
                     reports = [v for v in values if v.get("form") in ["10-K", "10-K/A", "10-Q", "10-Q/A"]]
             else:
-                # Instantaneous balance sheet / share counts (take latest available date)
                 reports = [v for v in values if v.get("form") in ["10-K", "10-K/A", "10-Q", "10-Q/A"]]
-            
             if reports:
                 reports.sort(key=lambda x: x.get("end", ""))
                 return float(reports[-1].get("val", 0.0))
     return 0.0
 
 def extract_annual_growth_rate(facts_json):
-    """Calculates historical annual revenue growth rate from the last two 10-K filings."""
     concepts = ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"]
     for concept in concepts:
         if "facts" in facts_json and "us-gaap" in facts_json["facts"] and concept in facts_json["facts"]["us-gaap"]:
@@ -77,7 +66,6 @@ def extract_annual_growth_rate(facts_json):
     return 0.10
 
 def fetch_live_price(ticker_symbol):
-    """Retrieves live stock price."""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?interval=1d&range=1d"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -88,7 +76,6 @@ def fetch_live_price(ticker_symbol):
         return 100.0
 
 def fetch_sec_financials(symbol):
-    """Ingests comprehensive financial and leverage data directly from SEC EDGAR."""
     ticker_map = get_sec_ticker_mapping()
     if symbol not in ticker_map:
         raise ValueError(f"Ticker '{symbol}' not found in SEC EDGAR directory.")
@@ -101,16 +88,13 @@ def fetch_sec_financials(symbol):
     
     facts = res.json()
 
-    # 1. Income & SBC Items (Flow metrics: full year duration)
     N_raw = extract_latest_xbrl_facts(facts, ["NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLoss", "ProfitLoss"], is_duration=True)
     G_raw = extract_latest_xbrl_facts(facts, ["AllocatedShareBasedCompensationExpense", "ShareBasedCompensation", "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense"], is_duration=True)
     T_raw = extract_latest_xbrl_facts(facts, ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity", "PaymentsRelatedToTaxWithholdingForShareBasedCompensation"], is_duration=True)
 
-    # 2. Cash & Liquid Securities
     cash_raw = extract_latest_xbrl_facts(facts, ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"])
     st_inv_raw = extract_latest_xbrl_facts(facts, ["MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesCurrent", "OtherShortTermInvestments"])
 
-    # 3. Comprehensive Total Debt (Short-Term, Long-Term, and Leases)
     lt_debt = extract_latest_xbrl_facts(facts, ["LongTermDebtNoncurrent", "LongTermDebtAndCapitalLeaseObligations"])
     st_debt = extract_latest_xbrl_facts(facts, ["DebtCurrent", "ShortTermBorrowings", "CommercialPaper"])
     leases_nc = extract_latest_xbrl_facts(facts, ["OperatingLeaseLiabilityNoncurrent", "FinanceLeaseLiabilityNoncurrent"])
@@ -120,7 +104,6 @@ def fetch_sec_financials(symbol):
     if total_debt_raw == 0.0:
         total_debt_raw = extract_latest_xbrl_facts(facts, ["LongTermDebt", "DebtAndCapitalLeaseObligations", "LiabilitiesOtherThanLongTermDebtAndCapitalLeasesCurrent"])
 
-    # 4. Diluted Share Count
     shares_raw = extract_latest_xbrl_facts(facts, ["WeightedAverageNumberOfDilutedSharesOutstanding"], is_duration=True)
     if shares_raw == 0.0:
         shares_raw = extract_latest_xbrl_facts(facts, ["EntityCommonStockSharesOutstanding"], taxonomy="dei")
@@ -131,37 +114,39 @@ def fetch_sec_financials(symbol):
     g1 = extract_annual_growth_rate(facts)
 
     return {
-        "ticker": symbol,
-        "price": price,
+        "ticker": symbol, "price": price,
         "shares": (shares_raw / 1e6) if shares_raw > 0 else 100.0,
-        "N": N_raw / 1e6,
-        "G": G_raw / 1e6,
-        "T": abs(T_raw) / 1e6,
-        "total_cash": (cash_raw + st_inv_raw) / 1e6,
-        "total_debt": total_debt_raw / 1e6,
+        "N": N_raw / 1e6, "G": G_raw / 1e6, "T": abs(T_raw) / 1e6,
+        "total_cash": (cash_raw + st_inv_raw) / 1e6, "total_debt": total_debt_raw / 1e6,
         "g1": g1
     }
 
-# User Controls
-ticker = st.text_input("Enter Stock Ticker", value="ADBE").upper().strip()
+# Search Bar - Initialized Empty
+ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ADBE, CRM, NOW, INTU, ADSK").upper().strip()
 tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=2)
 tier = AICT_TIERS[tier_name]
 
 if st.button("Evaluate Stock", type="primary"):
-    with st.spinner(f"Loading audited SEC facts for {ticker}..."):
-        try:
-            st.session_state["calc_data"] = fetch_sec_financials(ticker)
-        except Exception as e:
-            st.error(f"Error loading SEC data: {e}")
+    if not ticker:
+        st.warning("Please enter a stock ticker symbol first.")
+    else:
+        with st.spinner(f"Ingesting audited SEC 10-K facts for {ticker}..."):
+            try:
+                st.session_state["calc_data"] = fetch_sec_financials(ticker)
+            except Exception as e:
+                st.error(f"Error loading SEC data: {e}")
 
-if "calc_data" in st.session_state and st.session_state["calc_data"]["ticker"] == ticker:
+if "calc_data" in st.session_state and ticker and st.session_state["calc_data"]["ticker"] == ticker:
     cd = st.session_state["calc_data"]
 
-    # 1. Tragic Algebra SBC Dilution (Ω)
+    # 1. Tragic Algebra & Diagnostic Calculations
     C_val = cd["G"] * 0.20
     V_val = min(cd["T"], cd["G"] * 0.90 + cd["T"] * 0.20) if cd["T"] > 0 else cd["G"] * 1.10
     Omega = C_val + V_val
     auto_oe = max(1.0, cd["N"] + cd["G"] - Omega)
+
+    dilution_tax_rate = ((Omega - cd["G"]) / cd["N"] * 100.0) if cd["N"] > 0 else 0.0
+    buyback_treadmill_pct = min(100.0, (Omega / cd["T"] * 100.0)) if cd["T"] > 0 else 0.0
 
     # 2. Financial Adjustments Bar
     st.markdown("---")
@@ -177,47 +162,79 @@ if "calc_data" in st.session_state and st.session_state["calc_data"]["ticker"] =
         cash_adj = st.number_input("Cash & ST Inv ($M)", value=float(round(cd["total_cash"], 1)))
         debt_adj = st.number_input("Total Debt ($M)", value=float(round(cd["total_debt"], 1)))
 
-    # 3. 15-Year Hybrid Valuation Engine (r = 15%)
-    g2 = g1_adj * tier["mult"]
-    r = 0.15
-    stream = []
-    val = base_oe
-    for yr in range(1, 16):
-        val *= (1 + g1_adj) if yr <= tier["s1"] else (1 + g2)
-        stream.append(val)
+    # 3. Hamster Wheel Diagnostic Card
+    st.markdown("---")
+    st.subheader("🐹 Tragic Algebra Diagnostic")
+    d1, d2, d3 = st.columns(3)
+    d1.metric("True SBC Burden (Ω)", f"${Omega:,.1f} M", f"GAAP SBC: ${cd['G']:,.1f} M")
+    d2.metric("Dilution Tax Rate", f"{dilution_tax_rate:.1f}%", "Transfer from owners")
+    d3.metric("Buyback Offset Drag", f"{buyback_treadmill_pct:.1f}%", "Used to offset SBC")
 
-    pv_cf = sum([v / ((1 + r) ** y) for y, v in enumerate(stream, start=1)])
-    tv_dcf = (stream[-1] * (1 + tier["gt"])) / (r - tier["gt"]) if (r > tier["gt"]) else 0.0
-    pv_m1 = pv_cf + (tv_dcf / ((1 + r) ** 15))
-    pv_m2 = pv_cf + ((stream[-1] * exit_m_adj) / ((1 + r) ** 15))
-    hybrid_pv = (pv_m1 + pv_m2) / 2.0
+    if buyback_treadmill_pct > 80.0:
+        st.warning("⚠️ **Hamster Wheel Alert:** Over 80% of company buybacks merely neutralize employee stock grants rather than reducing share count!")
+    elif dilution_tax_rate > 25.0:
+        st.info("ℹ️ **High Dilution Drag:** Stock-based compensation significantly reduces the earnings attributable to common shareholders.")
 
-    net_cash = cash_adj - debt_adj
-    total_equity = hybrid_pv + net_cash
-    iv15 = total_equity / shares_adj if shares_adj > 0 else 0.0
+    # 4. Valuation Engine Helper
+    def run_valuation(oe_b, g_rate, t_rules, m_exit, s_count, c_val, d_val):
+        g_two = g_rate * t_rules["mult"]
+        r_rate = 0.15
+        s_stream = []
+        c_val_proj = oe_b
+        for y_idx in range(1, 16):
+            c_val_proj *= (1 + g_rate) if y_idx <= t_rules["s1"] else (1 + g_two)
+            s_stream.append(c_val_proj)
+        
+        pv_cfs = sum([v / ((1 + r_rate) ** y) for y, v in enumerate(s_stream, start=1)])
+        tv_dcf_calc = (s_stream[-1] * (1 + t_rules["gt"])) / (r_rate - t_rules["gt"]) if (r_rate > t_rules["gt"]) else 0.0
+        pv_m1_calc = pv_cfs + (tv_dcf_calc / ((1 + r_rate) ** 15))
+        pv_m2_calc = pv_cfs + ((s_stream[-1] * m_exit) / ((1 + r_rate) ** 15))
+        hyb_pv = (pv_m1_calc + pv_m2_calc) / 2.0
+        
+        n_cash = c_val - d_val
+        return (hyb_pv + n_cash) / s_count if s_count > 0 else 0.0
 
-    p_iv15 = cd["price"] / iv15 if iv15 > 0 else 999.0
-    iv12 = iv15 * ((1.15 / 1.12) ** 15)
-    iv18 = iv15 * ((1.15 / 1.18) ** 15)
+    iv15_baseline = run_valuation(base_oe, g1_adj, tier, exit_m_adj, shares_adj, cash_adj, debt_adj)
+    p_iv15 = cd["price"] / iv15_baseline if iv15_baseline > 0 else 999.0
+    iv12 = iv15_baseline * ((1.15 / 1.12) ** 15)
+    iv18 = iv15_baseline * ((1.15 / 1.18) ** 15)
 
-    # 4. Valuation Results Display
+    # 5. Stress-Testing Engine
+    st.markdown("---")
+    st.subheader("🧪 Scenario Stress-Testing Engine")
+    st.caption("Evaluate what happens to IV15 if growth slows or AI degrades the moat tier.")
+
+    stress_col1, stress_col2 = st.columns(2)
+    with stress_col1:
+        tier_keys = list(AICT_TIERS.keys())
+        def_downgrade_idx = min(len(tier_keys) - 1, tier_keys.index(tier_name) + 1)
+        stressed_tier_name = st.selectbox("Stress-Test Moat Downgrade", tier_keys, index=def_downgrade_idx)
+        stressed_tier = AICT_TIERS[stressed_tier_name]
+    with stress_col2:
+        growth_haircut_pct = st.slider("Growth Haircut (%)", min_value=-50, max_value=50, value=0, step=5)
+    
+    stressed_growth = max(0.01, g1_adj * (1 + (growth_haircut_pct / 100.0)))
+    stressed_iv15 = run_valuation(base_oe, stressed_growth, stressed_tier, stressed_tier["exit_m"], shares_adj, cash_adj, debt_adj)
+    stressed_p_iv15 = cd["price"] / stressed_iv15 if stressed_iv15 > 0 else 999.0
+
+    # 6. Results Display
     st.markdown("---")
     st.subheader(f"📊 Valuation Verdict: {ticker}")
 
     res_c1, res_c2, res_c3 = st.columns(3)
     res_c1.metric("Market Price", f"${cd['price']:.2f}")
-    res_c2.metric("Estimated IV15", f"${iv15:.2f}", f"P/IV15: {p_iv15:.2f}x")
-    res_c3.metric("Owners' Earnings (OE)", f"${base_oe:,.0f} M", f"Growth: {g1_adj*100:.1f}%")
+    res_c2.metric("Baseline IV15", f"${iv15_baseline:.2f}", f"P/IV15: {p_iv15:.2f}x")
+    res_c3.metric("Stressed IV15", f"${stressed_iv15:.2f}", f"P/IV15: {stressed_p_iv15:.2f}x")
 
- # 4. Clean Verdict Banners (Escaped dollar signs prevent LaTeX math glitches)
+    # Decision Banner (LaTeX Escaped)
     if p_iv15 <= 1.0:
-        st.success(f"🎯 **FAT PITCH (BUY)**: At **${cd['price']:.2f}**, {ticker} is priced below IV15 (**${iv15:.2f}**) and offers an estimated ≥15% annualized return.")
+        st.success(f"🎯 **FAT PITCH (BUY)**: At **\${cd['price']:.2f}**, {ticker} is priced below baseline IV15 (**\${iv15_baseline:.2f}**) and offers an estimated ≥15% annualized return.")
     elif p_iv15 <= 1.5:
-        st.info(f"⚠️ **JUST OUTSIDE (WATCHLIST)**: At **${cd['price']:.2f}**, price approaches value territory. Expected return ~12%–14% (IV12: **${iv12:.2f}**).")
+        st.info(f"⚠️ **JUST OUTSIDE (WATCHLIST)**: At **\${cd['price']:.2f}**, price approaches value territory. Expected return ~12%–14% (IV12: **\${iv12:.2f}**).")
     else:
-        st.error(f"⛔ **OUT FIELD (OVERVALUED)**: Price (\${cd['price']:.2f}) is well above IV15 (\${iv15:.2f}).")
-        
+        st.error(f"⛔ **OUT FIELD (OVERVALUED)**: Price (\${cd['price']:.2f}) is well above IV15 (\${iv15_baseline:.2f}).")
+
     st.write("**Target Entry Bands:**")
-    st.write(f"- **18% Annual Return (Deep Margin of Safety):** Buy under **${iv18:.2f}**")
-    st.write(f"- **15% Annual Return (IV15 Baseline):** Buy under **${iv15:.2f}**")
-    st.write(f"- **12% Annual Return (Fair / Moderate):** Buy under **${iv12:.2f}**")
+    st.write(f"- **18% Annual Return (Deep Margin of Safety):** Buy under **\${iv18:.2f}**")
+    st.write(f"- **15% Annual Return (IV15 Baseline):** Buy under **\${iv15_baseline:.2f}**")
+    st.write(f"- **12% Annual Return (Fair / Moderate):** Buy under **\${iv12:.2f}**")
