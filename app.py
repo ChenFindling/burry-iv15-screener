@@ -42,7 +42,6 @@ def extract_latest_xbrl_facts(facts_json, concept_names, taxonomy="us-gaap", is_
             values = units.get("USD", units.get("shares", []))
             
             if is_flow:
-                # Flow items (Net Income, SBC, Buybacks): Must be 10-K full year filings (FY / CY)
                 annual_reports = [
                     v for v in values 
                     if v.get("form") in ["10-K", "10-K/A"] 
@@ -50,11 +49,9 @@ def extract_latest_xbrl_facts(facts_json, concept_names, taxonomy="us-gaap", is_
                     and "start" in v and "end" in v
                 ]
                 if annual_reports:
-                    # Sort by the period end date to get the latest completed fiscal year
                     annual_reports.sort(key=lambda x: x.get("end", ""))
                     return float(annual_reports[-1].get("val", 0.0))
             else:
-                # Balance sheet & Shares items: Latest available point-in-time filing (10-K or 10-Q)
                 point_in_time = [v for v in values if v.get("form") in ["10-K", "10-K/A", "10-Q", "10-Q/A"]]
                 if point_in_time:
                     point_in_time.sort(key=lambda x: x.get("end", ""))
@@ -63,22 +60,24 @@ def extract_latest_xbrl_facts(facts_json, concept_names, taxonomy="us-gaap", is_
 
 def extract_annual_growth_rate(facts_json):
     concepts = ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"]
-    for concept in concepts:
-        if "facts" in facts_json and "us-gaap" in facts_json["facts"] and concept in facts_json["facts"][concept]:
-            units = facts_json["facts"]["us-gaap"][concept].get("units", {}).get("USD", [])
-            annual = [
-                v for v in units 
-                if v.get("form") in ["10-K", "10-K/A"] 
-                and v.get("fp") in ["FY", "CY"]
-                and "start" in v and "end" in v
-            ]
-            if len(annual) >= 2:
-                annual.sort(key=lambda x: x.get("end", ""))
-                v_latest = annual[-1].get("val", 0.0)
-                v_prev = annual[-2].get("val", 0.0)
-                if v_prev > 0:
-                    g = (v_latest - v_prev) / v_prev
-                    return max(0.03, min(g, 0.18))
+    if "facts" in facts_json and "us-gaap" in facts_json["facts"]:
+        us_gaap_facts = facts_json["facts"]["us-gaap"]
+        for concept in concepts:
+            if concept in us_gaap_facts:
+                units = us_gaap_facts[concept].get("units", {}).get("USD", [])
+                annual = [
+                    v for v in units 
+                    if v.get("form") in ["10-K", "10-K/A"] 
+                    and v.get("fp") in ["FY", "CY"]
+                    and "start" in v and "end" in v
+                ]
+                if len(annual) >= 2:
+                    annual.sort(key=lambda x: x.get("end", ""))
+                    v_latest = annual[-1].get("val", 0.0)
+                    v_prev = annual[-2].get("val", 0.0)
+                    if v_prev > 0:
+                        g = (v_latest - v_prev) / v_prev
+                        return max(0.03, min(g, 0.18))
     return 0.10
 
 def fetch_live_price(ticker_symbol):
@@ -104,7 +103,7 @@ def fetch_sec_financials(symbol):
     
     facts = res.json()
 
-    # 1. Income & SBC Items (Flow metrics: full year duration only)
+    # 1. Income & SBC Items (Flow metrics: full year duration)
     N_raw = extract_latest_xbrl_facts(facts, ["NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLoss", "ProfitLoss"], is_flow=True)
     G_raw = extract_latest_xbrl_facts(facts, ["AllocatedShareBasedCompensationExpense", "ShareBasedCompensation", "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense"], is_flow=True)
     T_raw = extract_latest_xbrl_facts(facts, ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity", "PaymentsRelatedToTaxWithholdingForShareBasedCompensation"], is_flow=True)
