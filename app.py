@@ -55,7 +55,6 @@ def get_xbrl_instant_val(facts_tree, concept_list, taxonomy="us-gaap"):
     return 0.0
 
 def extract_dynamic_growth_rate(facts_tree):
-    """Calculates historical annual revenue growth from the last 2 completed 10-K periods."""
     concepts = [
         "RevenueFromContractWithCustomerExcludingAssessedTax",
         "Revenues",
@@ -90,7 +89,7 @@ def fetch_sec_data(symbol):
     
     facts = res.json()
 
-    # 1. Income & SBC (Broadened GAAP tags across all parent consolidation structures)
+    # 1. Income & SBC
     N_val = get_xbrl_annual_val(facts, [
         "NetIncomeLoss", 
         "NetIncomeLossAvailableToCommonStockholdersBasic", 
@@ -111,7 +110,7 @@ def fetch_sec_data(symbol):
         "PaymentsForRepurchaseOfOtherEquity"
     ])
 
-    # 2. Balance Sheet Cash & Marketable Securities
+    # 2. Cash & Liquid Investments
     cash_val = get_xbrl_instant_val(facts, [
         "CashAndCashEquivalentsAtCarryingValue", 
         "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
@@ -124,9 +123,21 @@ def fetch_sec_data(symbol):
         "MarketableSecurities"
     ])
 
-    # 3. Funded Corporate Debt
-    lt_debt = get_xbrl_instant_val(facts, ["LongTermDebtNoncurrent", "LongTermDebt", "SeniorNotes"])
-    st_debt = get_xbrl_instant_val(facts, ["DebtCurrent", "ShortTermBorrowings", "CommercialPaper"])
+    # 3. Funded Corporate Debt & Notes
+    lt_debt = get_xbrl_instant_val(facts, [
+        "LongTermDebtNoncurrent", 
+        "LongTermDebt", 
+        "SeniorNotes",
+        "ConvertibleDebtNoncurrent",
+        "NotesPayableNoncurrent"
+    ])
+    st_debt = get_xbrl_instant_val(facts, [
+        "DebtCurrent", 
+        "ShortTermBorrowings", 
+        "CommercialPaper",
+        "LinesOfCreditCurrent",
+        "NotesPayableCurrent"
+    ])
     total_debt_val = lt_debt + st_debt
 
     # 4. Diluted Share Count
@@ -164,7 +175,7 @@ def fetch_sec_data(symbol):
     }
 
 # Search Bar
-ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. ADBE, NOW, CRM, GOOGL, PAYC").upper().strip()
+ticker = st.text_input("Enter Stock Ticker", value="", placeholder="e.g. CRDO, ADBE, NOW, CRM, GOOGL").upper().strip()
 tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=2)
 tier = AICT_TIERS[tier_name]
 
