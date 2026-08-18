@@ -209,14 +209,14 @@ if "calc_data" in st.session_state and st.session_state["calc_data"]["ticker"] =
     res_c2.metric("Estimated IV15", f"${iv15:.2f}", f"P/IV15: {p_iv15:.2f}x")
     res_c3.metric("Owners' Earnings (OE)", f"${base_oe:,.0f} M", f"Growth: {g1_adj*100:.1f}%")
 
-   # Clean string formatting without broken markdown asterisks
+ # 4. Clean Verdict Banners (Escaped dollar signs prevent LaTeX math glitches)
     if p_iv15 <= 1.0:
-        st.success(f"🎯 **FAT PITCH (BUY)**: At ${cd['price']:.2f}, {ticker} is priced below IV15 (${iv15:.2f}) and offers an estimated ≥15% annualized return.")
+        st.success(f"🎯 **FAT PITCH (BUY)**: At **${cd['price']:.2f}**, {ticker} is priced below IV15 (**${iv15:.2f}**) and offers an estimated ≥15% annualized return.")
     elif p_iv15 <= 1.5:
-        st.info(f"⚠️ **JUST OUTSIDE (WATCHLIST)**: At ${cd['price']:.2f}, price approaches value territory. Expected return ~12%–14% (IV12: ${iv12:.2f}).")
+        st.info(f"⚠️ **JUST OUTSIDE (WATCHLIST)**: At **${cd['price']:.2f}**, price approaches value territory. Expected return ~12%–14% (IV12: **${iv12:.2f}**).")
     else:
-        st.error(f"⛔ **OUT FIELD (OVERVALUED)**: Price (${cd['price']:.2f}) is well above IV15 (${iv15:.2f}).")
-
+        st.error(f"⛔ **OUT FIELD (OVERVALUED)**: Price (\${cd['price']:.2f}) is well above IV15 (\${iv15:.2f}).")
+        
     st.write("**Target Entry Bands:**")
     st.write(f"- **18% Annual Return (Deep Margin of Safety):** Buy under **${iv18:.2f}**")
     st.write(f"- **15% Annual Return (IV15 Baseline):** Buy under **${iv15:.2f}**")
