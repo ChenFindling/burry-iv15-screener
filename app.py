@@ -2,12 +2,11 @@ import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
-import time
 
 st.set_page_config(page_title="Burry IV15 Screener", layout="centered")
 
 st.title("🎯 Burry IV15 Value Screener")
-st.caption("Automated SEC EDGAR XBRL Ingestion & AICT Moat Valuation Engine")
+st.caption("Automated SEC EDGAR Audited Financials & AICT Moat Valuation Engine")
 
 # 1. AICT Moat Tier Rules
 AICT_TIERS = {
@@ -18,7 +17,6 @@ AICT_TIERS = {
     "Wood (Fragile / Wrapper / No R&D)": {"s1": 2, "mult": 0.25, "gt": 0.00, "debt_cap": 0.0, "exit_m": 5.0}
 }
 
-# 2. Official SEC EDGAR Financial Ingestion Routine
 SEC_HEADERS = {
     "User-Agent": "ValueInvestorResearch admin@valueinvestor.org",
     "Accept-Encoding": "gzip, deflate"
@@ -26,7 +24,7 @@ SEC_HEADERS = {
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_sec_ticker_mapping():
-    """Maps Stock Tickers to SEC 10-digit CIKs"""
+    """Maps Tickers to SEC 10-digit CIK numbers."""
     url = "https://www.sec.gov/files/company_tickers.json"
     res = requests.get(url, headers=SEC_HEADERS, timeout=10)
     data = res.json()
@@ -35,8 +33,11 @@ def get_sec_ticker_mapping():
         mapping[entry["ticker"].upper()] = str(entry["cik_str"]).zfill(10)
     return mapping
 
-def extract_latest_xbrl_annual(facts_json, concept_names, taxonomy="us-gaap"):
-    """Extracts the most recent annual 10-K reported value for a list of possible XBRL tags"""
+def extract_latest_xbrl_facts(facts_json, concept_names, taxonomy="us-gaap", is_duration=False):
+    """
+    Extracts the most recent 10-K or 10-Q reported value across matching XBRL concepts.
+    If is_duration=True, prefers full-year (10-K) numbers for flow metrics (Income, SBC, Buybacks).
+    """
     if "facts" not in facts_json or taxonomy not in facts_json["facts"]:
         return 0.0
     
@@ -44,15 +45,39 @@ def extract_latest_xbrl_annual(facts_json, concept_names, taxonomy="us-gaap"):
         if concept in facts_json["facts"][taxonomy]:
             units = facts_json["facts"][taxonomy][concept].get("units", {})
             values = units.get("USD", units.get("shares", []))
-            # Filter to 10-K full year filings
-            annual = [v for v in values if v.get("form") in ["10-K", "10-K/A"] and v.get("fp") in ["FY", "CY"]]
-            if annual:
-                annual.sort(key=lambda x: x.get("fy", 0))
-                return float(annual[-1].get("val", 0.0))
+            
+            if is_duration:
+                # Prefer full-year 10-K filings for Income/Cash Flow items
+                reports = [v for v in values if v.get("form") in ["10-K", "10-K/A"] and v.get("fp") in ["FY", "CY"]]
+                if not reports:
+                    reports = [v for v in values if v.get("form") in ["10-K", "10-K/A", "10-Q", "10-Q/A"]]
+            else:
+                # Instantaneous balance sheet / share counts (take latest available date)
+                reports = [v for v in values if v.get("form") in ["10-K", "10-K/A", "10-Q", "10-Q/A"]]
+            
+            if reports:
+                reports.sort(key=lambda x: x.get("end", ""))
+                return float(reports[-1].get("val", 0.0))
     return 0.0
 
+def extract_annual_growth_rate(facts_json):
+    """Calculates historical annual revenue growth rate from the last two 10-K filings."""
+    concepts = ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"]
+    for concept in concepts:
+        if "facts" in facts_json and "us-gaap" in facts_json["facts"] and concept in facts_json["facts"]["us-gaap"]:
+            units = facts_json["facts"]["us-gaap"][concept].get("units", {}).get("USD", [])
+            annual = [v for v in units if v.get("form") in ["10-K", "10-K/A"] and v.get("fp") in ["FY", "CY"]]
+            if len(annual) >= 2:
+                annual.sort(key=lambda x: x.get("end", ""))
+                v_latest = annual[-1].get("val", 0.0)
+                v_prev = annual[-2].get("val", 0.0)
+                if v_prev > 0:
+                    g = (v_latest - v_prev) / v_prev
+                    return max(0.03, min(g, 0.18))
+    return 0.10
+
 def fetch_live_price(ticker_symbol):
-    """Fetches real-time price via lightweight public quote endpoints"""
+    """Retrieves live stock price."""
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker_symbol}?interval=1d&range=1d"
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -63,7 +88,7 @@ def fetch_live_price(ticker_symbol):
         return 100.0
 
 def fetch_sec_financials(symbol):
-    """Ingests official 10-K reported numbers from SEC EDGAR API"""
+    """Ingests comprehensive financial and leverage data directly from SEC EDGAR."""
     ticker_map = get_sec_ticker_mapping()
     if symbol not in ticker_map:
         raise ValueError(f"Ticker '{symbol}' not found in SEC EDGAR directory.")
@@ -76,42 +101,54 @@ def fetch_sec_financials(symbol):
     
     facts = res.json()
 
-    # XBRL Concept Tags
-    N_raw = extract_latest_xbrl_annual(facts, ["NetIncomeLoss", "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"])
-    G_raw = extract_latest_xbrl_annual(facts, ["AllocatedShareBasedCompensationExpense", "ShareBasedCompensation", "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense"])
-    T_raw = extract_latest_xbrl_annual(facts, ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity"])
+    # 1. Income & SBC Items (Flow metrics: full year duration)
+    N_raw = extract_latest_xbrl_facts(facts, ["NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLoss", "ProfitLoss"], is_duration=True)
+    G_raw = extract_latest_xbrl_facts(facts, ["AllocatedShareBasedCompensationExpense", "ShareBasedCompensation", "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense"], is_duration=True)
+    T_raw = extract_latest_xbrl_facts(facts, ["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity", "PaymentsRelatedToTaxWithholdingForShareBasedCompensation"], is_duration=True)
+
+    # 2. Cash & Liquid Securities
+    cash_raw = extract_latest_xbrl_facts(facts, ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"])
+    st_inv_raw = extract_latest_xbrl_facts(facts, ["MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesCurrent", "OtherShortTermInvestments"])
+
+    # 3. Comprehensive Total Debt (Short-Term, Long-Term, and Leases)
+    lt_debt = extract_latest_xbrl_facts(facts, ["LongTermDebtNoncurrent", "LongTermDebtAndCapitalLeaseObligations"])
+    st_debt = extract_latest_xbrl_facts(facts, ["DebtCurrent", "ShortTermBorrowings", "CommercialPaper"])
+    leases_nc = extract_latest_xbrl_facts(facts, ["OperatingLeaseLiabilityNoncurrent", "FinanceLeaseLiabilityNoncurrent"])
+    leases_cur = extract_latest_xbrl_facts(facts, ["OperatingLeaseLiabilityCurrent", "FinanceLeaseLiabilityCurrent"])
     
-    cash_raw = extract_latest_xbrl_annual(facts, ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"])
-    st_inv_raw = extract_latest_xbrl_annual(facts, ["MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesCurrent", "OtherShortTermInvestments"])
-    debt_raw = extract_latest_xbrl_annual(facts, ["LongTermDebtNoncurrent", "LongTermDebtAndCapitalLeaseObligations", "DebtCurrent"])
-    shares_raw = extract_latest_xbrl_annual(facts, ["EntityCommonStockSharesOutstanding"], taxonomy="dei")
+    total_debt_raw = lt_debt + st_debt + leases_nc + leases_cur
+    if total_debt_raw == 0.0:
+        total_debt_raw = extract_latest_xbrl_facts(facts, ["LongTermDebt", "DebtAndCapitalLeaseObligations", "LiabilitiesOtherThanLongTermDebtAndCapitalLeasesCurrent"])
+
+    # 4. Diluted Share Count
+    shares_raw = extract_latest_xbrl_facts(facts, ["WeightedAverageNumberOfDilutedSharesOutstanding"], is_duration=True)
     if shares_raw == 0.0:
-        shares_raw = extract_latest_xbrl_annual(facts, ["CommonStockSharesOutstanding"])
+        shares_raw = extract_latest_xbrl_facts(facts, ["EntityCommonStockSharesOutstanding"], taxonomy="dei")
+    if shares_raw == 0.0:
+        shares_raw = extract_latest_xbrl_facts(facts, ["CommonStockSharesOutstanding"])
 
     price = fetch_live_price(symbol)
-    
-    # Scale raw Dollars to Millions
-    N = N_raw / 1e6
-    G = G_raw / 1e6
-    T = abs(T_raw) / 1e6
-    cash = (cash_raw + st_inv_raw) / 1e6
-    debt = debt_raw / 1e6
-    shares = (shares_raw / 1e6) if shares_raw > 0 else 100.0
+    g1 = extract_annual_growth_rate(facts)
 
     return {
-        "ticker": symbol, "price": price, "shares": shares,
-        "N": N, "G": G, "T": T,
-        "total_cash": cash, "total_debt": debt,
-        "g1": 0.10
+        "ticker": symbol,
+        "price": price,
+        "shares": (shares_raw / 1e6) if shares_raw > 0 else 100.0,
+        "N": N_raw / 1e6,
+        "G": G_raw / 1e6,
+        "T": abs(T_raw) / 1e6,
+        "total_cash": (cash_raw + st_inv_raw) / 1e6,
+        "total_debt": total_debt_raw / 1e6,
+        "g1": g1
     }
 
-# 3. User Controls
+# User Controls
 ticker = st.text_input("Enter Stock Ticker", value="ADBE").upper().strip()
 tier_name = st.selectbox("Baseline AICT Moat Tier", list(AICT_TIERS.keys()), index=2)
 tier = AICT_TIERS[tier_name]
 
 if st.button("Evaluate Stock", type="primary"):
-    with st.spinner(f"Ingesting official SEC 10-K facts for {ticker}..."):
+    with st.spinner(f"Loading audited SEC facts for {ticker}..."):
         try:
             st.session_state["calc_data"] = fetch_sec_financials(ticker)
         except Exception as e:
@@ -120,15 +157,15 @@ if st.button("Evaluate Stock", type="primary"):
 if "calc_data" in st.session_state and st.session_state["calc_data"]["ticker"] == ticker:
     cd = st.session_state["calc_data"]
 
-    # 4. Tragic Algebra SBC Dilution (Ω)
+    # 1. Tragic Algebra SBC Dilution (Ω)
     C_val = cd["G"] * 0.20
     V_val = min(cd["T"], cd["G"] * 0.90 + cd["T"] * 0.20) if cd["T"] > 0 else cd["G"] * 1.10
     Omega = C_val + V_val
     auto_oe = max(1.0, cd["N"] + cd["G"] - Omega)
 
-    # 5. Financial Adjustments Bar (Allows Fast Manual Refinements)
+    # 2. Financial Adjustments Bar
     st.markdown("---")
-    st.subheader("⚙️ SEC 10-K Data & Parameters")
+    st.subheader("⚙️ Underlying Financials & Adjustments")
     adj_c1, adj_c2, adj_c3 = st.columns(3)
     with adj_c1:
         base_oe = st.number_input("Base Owners' Earnings ($M) [OE]", value=float(round(auto_oe, 1)))
@@ -140,7 +177,7 @@ if "calc_data" in st.session_state and st.session_state["calc_data"]["ticker"] =
         cash_adj = st.number_input("Cash & ST Inv ($M)", value=float(round(cd["total_cash"], 1)))
         debt_adj = st.number_input("Total Debt ($M)", value=float(round(cd["total_debt"], 1)))
 
-    # 6. 15-Year Hybrid Valuation Engine (r = 15%)
+    # 3. 15-Year Hybrid Valuation Engine (r = 15%)
     g2 = g1_adj * tier["mult"]
     r = 0.15
     stream = []
@@ -163,7 +200,7 @@ if "calc_data" in st.session_state and st.session_state["calc_data"]["ticker"] =
     iv12 = iv15 * ((1.15 / 1.12) ** 15)
     iv18 = iv15 * ((1.15 / 1.18) ** 15)
 
-    # 7. Valuation Verdict Display
+    # 4. Valuation Results Display
     st.markdown("---")
     st.subheader(f"📊 Valuation Verdict: {ticker}")
 
