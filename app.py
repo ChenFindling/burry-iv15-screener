@@ -29,89 +29,101 @@ def get_sec_ticker_mapping():
     data = res.json()
     return {entry["ticker"].upper(): str(entry["cik_str"]).zfill(10) for entry in data.values()}
 
-# --- REWRITTEN BULLETPROOF SEC EXTRACTION ---
-def get_xbrl_annual_val(facts_tree, concept_list, taxonomy="us-gaap"):
+def get_latest_report_year(facts_tree):
+    """Identifies the most recent fiscal year the company has reported to filter out stale tags."""
+    for tag in ["NetIncomeLoss", "Assets", "Liabilities", "CommonStockSharesOutstanding"]:
+        try:
+            units = facts_tree["facts"]["us-gaap"][tag]["units"]
+            rows = units.get("USD", units.get("shares", []))
+            if rows:
+                return int(sorted([r.get("end", "2000-01-01") for r in rows])[-1][:4])
+        except Exception:
+            continue
+    return 2020
+
+def get_xbrl_annual_val(facts_tree, concept_list, latest_year, taxonomy="us-gaap"):
     if "facts" not in facts_tree or taxonomy not in facts_tree["facts"]:
         return 0.0
-    all_rows = []
-    # Aggregate all concepts before deciding
+    
     for concept in concept_list:
         if concept in facts_tree["facts"][taxonomy]:
             units = facts_tree["facts"][taxonomy][concept].get("units", {})
             rows = units.get("USD", units.get("shares", []))
-            all_rows.extend(rows)
             
-    if not all_rows:
-        return 0.0
-        
-    frame_rows = [r for r in all_rows if "frame" in r and len(r["frame"]) == 6]
-    if frame_rows:
-        frame_rows.sort(key=lambda x: x.get("end", ""))
-        return float(frame_rows[-1].get("val", 0.0))
-        
-    fy_rows = [r for r in all_rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
-    if fy_rows:
-        fy_rows.sort(key=lambda x: x.get("end", ""))
-        return float(fy_rows[-1].get("val", 0.0))
+            # STALE TAG KILL SWITCH: Ignore any tag not updated in the last 12-18 months
+            valid_rows = [r for r in rows if r.get("end", "2000")[:4].isdigit() and int(r.get("end", "2000")[:4]) >= latest_year - 1]
+            if not valid_rows:
+                continue
+                
+            frame_rows = [r for r in valid_rows if "frame" in r and len(r["frame"]) == 6]
+            if frame_rows:
+                frame_rows.sort(key=lambda x: x.get("end", ""))
+                return float(frame_rows[-1].get("val", 0.0))
+                
+            fy_rows = [r for r in valid_rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
+            if fy_rows:
+                fy_rows.sort(key=lambda x: x.get("end", ""))
+                return float(fy_rows[-1].get("val", 0.0))
     return 0.0
 
-def get_xbrl_instant_val(facts_tree, concept_list, taxonomy="us-gaap"):
+def get_xbrl_instant_val(facts_tree, concept_list, latest_year, taxonomy="us-gaap"):
     if "facts" not in facts_tree or taxonomy not in facts_tree["facts"]:
         return 0.0
-    all_rows = []
-    # Aggregate all concepts before deciding
+        
     for concept in concept_list:
         if concept in facts_tree["facts"][taxonomy]:
             units = facts_tree["facts"][taxonomy][concept].get("units", {})
             rows = units.get("USD", units.get("shares", []))
-            all_rows.extend(rows)
             
-    if not all_rows:
-        return 0.0
-        
-    frame_rows = [r for r in all_rows if "frame" in r and r["frame"].endswith("I")]
-    if frame_rows:
-        frame_rows.sort(key=lambda x: x.get("end", ""))
-        return float(frame_rows[-1].get("val", 0.0))
-        
-    valid_rows = [r for r in all_rows if r.get("form") in ["10-K", "10-Q"]]
-    if valid_rows:
-        valid_rows.sort(key=lambda x: (x.get("end", ""), x.get("filed", "")))
-        return float(valid_rows[-1].get("val", 0.0))
+            # STALE TAG KILL SWITCH
+            valid_rows = [r for r in rows if r.get("end", "2000")[:4].isdigit() and int(r.get("end", "2000")[:4]) >= latest_year - 1]
+            if not valid_rows:
+                continue
+                
+            frame_rows = [r for r in valid_rows if "frame" in r and r["frame"].endswith("I")]
+            if frame_rows:
+                frame_rows.sort(key=lambda x: x.get("end", ""))
+                return float(frame_rows[-1].get("val", 0.0))
+                
+            report_rows = [r for r in valid_rows if r.get("form") in ["10-K", "10-Q"]]
+            if report_rows:
+                report_rows.sort(key=lambda x: (x.get("end", ""), x.get("filed", "")))
+                return float(report_rows[-1].get("val", 0.0))
     return 0.0
 
-def extract_dynamic_growth_rate(facts_tree):
+def extract_dynamic_growth_rate(facts_tree, latest_year):
     concepts = [
         "RevenueFromContractWithCustomerExcludingAssessedTax",
         "Revenues",
         "SalesRevenueNet",
         "RevenueFromContractWithCustomerIncludingAssessedTax"
     ]
-    all_rows = []
     if "facts" in facts_tree and "us-gaap" in facts_tree["facts"]:
         us_facts = facts_tree["facts"]["us-gaap"]
         for concept in concepts:
             if concept in us_facts:
                 units = us_facts[concept].get("units", {}).get("USD", [])
-                all_rows.extend(units)
                 
-        if all_rows:
-            fy_rows = [r for r in all_rows if "frame" in r and len(r["frame"]) == 6]
-            if not fy_rows:
-                fy_rows = [r for r in all_rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
-            
-            if fy_rows:
-                unique_periods = {}
-                for r in fy_rows:
-                    unique_periods[r.get("end", "")] = float(r.get("val", 0.0))
+                valid_rows = [r for r in units if r.get("end", "2000")[:4].isdigit() and int(r.get("end", "2000")[:4]) >= latest_year - 2]
+                if not valid_rows:
+                    continue
+                    
+                fy_rows = [r for r in valid_rows if "frame" in r and len(r["frame"]) == 6]
+                if not fy_rows:
+                    fy_rows = [r for r in valid_rows if r.get("form") in ["10-K", "10-K/A"] and r.get("fp") in ["FY", "CY"]]
                 
-                sorted_dates = sorted(list(unique_periods.keys()))
-                if len(sorted_dates) >= 2:
-                    v_latest = unique_periods[sorted_dates[-1]]
-                    v_prev = unique_periods[sorted_dates[-2]]
-                    if v_prev > 0 and v_latest > 0:
-                        g = (v_latest - v_prev) / v_prev
-                        return float(max(0.03, min(g, 0.22)))
+                if fy_rows:
+                    unique_periods = {}
+                    for r in fy_rows:
+                        unique_periods[r.get("end", "")] = float(r.get("val", 0.0))
+                    
+                    sorted_dates = sorted(list(unique_periods.keys()))
+                    if len(sorted_dates) >= 2:
+                        v_latest = unique_periods[sorted_dates[-1]]
+                        v_prev = unique_periods[sorted_dates[-2]]
+                        if v_prev > 0 and v_latest > 0:
+                            g = (v_latest - v_prev) / v_prev
+                            return float(max(0.03, min(g, 0.22)))
     return 0.10
 
 def fetch_sec_data(symbol):
@@ -126,64 +138,71 @@ def fetch_sec_data(symbol):
         raise ConnectionError(f"SEC API returned status code {res.status_code}")
     
     facts = res.json()
+    
+    latest_year = get_latest_report_year(facts)
 
     # 1. Audited Income Statement & SBC
     N_val = get_xbrl_annual_val(facts, [
         "NetIncomeLoss", 
         "NetIncomeLossAvailableToCommonStockholdersBasic", 
         "ProfitLoss"
-    ])
+    ], latest_year)
+    
     G_val = get_xbrl_annual_val(facts, [
         "AllocatedShareBasedCompensationExpense", 
         "ShareBasedCompensation", 
         "ShareBasedCompensationArrangementByShareBasedPaymentAwardExpense"
-    ])
+    ], latest_year)
+    
     T_val = get_xbrl_annual_val(facts, [
         "PaymentsForRepurchaseOfCommonStock", 
         "PaymentsForRepurchaseOfEquity", 
         "PaymentsRelatedToTaxWithholdingForShareBasedCompensation"
-    ])
+    ], latest_year)
 
     # 2. Strict Balance Sheet Liquid Assets
     cash_val = get_xbrl_instant_val(facts, [
         "CashAndCashEquivalentsAtCarryingValue", 
         "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"
-    ])
+    ], latest_year)
+    
     st_inv_val = get_xbrl_instant_val(facts, [
         "MarketableSecuritiesCurrent", 
         "AvailableForSaleSecuritiesCurrent"
-    ])
+    ], latest_year)
 
-    # 3. Total Funded Debt
+    # 3. Total Funded Debt (Prioritizing new Oracle tags over abandoned ones)
     lt_debt = get_xbrl_instant_val(facts, [
-        "LongTermDebtNoncurrent",
         "NotesPayableAndOtherBorrowingsNoncurrent",
+        "LongTermDebtNoncurrent",
         "LongTermDebtAndCapitalLeaseObligations", 
         "SeniorNotes",
         "LongTermDebt",
         "ConvertibleDebtNoncurrent",
         "NotesPayableNoncurrent"
-    ])
+    ], latest_year)
+    
     st_debt = get_xbrl_instant_val(facts, [
-        "DebtCurrent", 
         "NotesPayableAndOtherBorrowingsCurrent",
+        "DebtCurrent", 
         "ShortTermBorrowings", 
         "CommercialPaper",
         "LongTermDebtCurrent",
         "LinesOfCreditCurrent",
         "NotesPayableCurrent"
-    ])
+    ], latest_year)
+    
     total_debt_val = lt_debt + st_debt
 
     # 4. Diluted Share Count
     shares_val = get_xbrl_annual_val(facts, [
         "WeightedAverageNumberOfDilutedSharesOutstanding", 
         "WeightedAverageNumberOfSharesOutstandingDiluted"
-    ])
+    ], latest_year)
     if shares_val == 0.0:
-        shares_val = get_xbrl_instant_val(facts, ["EntityCommonStockSharesOutstanding"], taxonomy="dei")
+        shares_val = get_xbrl_instant_val(facts, ["EntityCommonStockSharesOutstanding"], latest_year, taxonomy="dei")
     if shares_val == 0.0:
-        shares_val = get_xbrl_instant_val(facts, ["CommonStockSharesOutstanding"])
+        shares_val = get_xbrl_instant_val(facts, ["CommonStockSharesOutstanding"], latest_year)
 
     # 5. Live Market Price via quote stream
     price_val = 100.0
@@ -195,7 +214,7 @@ def fetch_sec_data(symbol):
     except Exception:
         pass
 
-    g1_val = extract_dynamic_growth_rate(facts)
+    g1_val = extract_dynamic_growth_rate(facts, latest_year)
 
     return {
         "ticker": symbol,
