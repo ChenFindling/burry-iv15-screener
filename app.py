@@ -297,7 +297,10 @@ def expected_return(price: float, p: IVParams) -> float:
     for _ in range(200):
         mid = (lo + hi) / 2
         lo, hi = (mid, hi) if intrinsic_value(p, mid * 100) > price else (lo, mid)
-    return (lo + hi) / 2
+    out = (lo + hi) / 2
+    # Saturating at the ceiling is not a 300% forecast, it means the inputs are
+    # wrong — nearly always a bad share count.
+    return float("inf") if out > 2.5 else out
 
 
 def solve_growth(target_iv15: float, p: IVParams,
@@ -390,6 +393,25 @@ def _ticker_map() -> dict[str, str]:
                      headers=SEC_HEADERS, timeout=15)
     r.raise_for_status()
     return {e["ticker"].upper(): str(e["cik_str"]).zfill(10) for e in r.json().values()}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _sic(cik: str) -> tuple[str, str]:
+    """SIC code and description, for sector-specific guards."""
+    try:
+        r = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json",
+                         headers=SEC_HEADERS, timeout=20)
+        j = r.json()
+        return str(j.get("sic", "")), str(j.get("sicDescription", ""))
+    except Exception:
+        return "", ""
+
+
+def is_financial(sic: str) -> bool:
+    """SIC 6000-6799: banks, insurers, brokers, REITs. For these, investments
+    back policyholder or depositor liabilities and are not shareholder cash, so
+    a balance-sheet 'net cash' figure is meaningless and hugely overstated."""
+    return sic.isdigit() and 6000 <= int(sic) <= 6799
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -535,6 +557,7 @@ def load(ticker: str, n_years: int = 10):
     if ticker not in cmap:
         raise ValueError(f"'{ticker}' is not in the SEC company list.")
     facts = _facts(cmap[ticker])
+    sic, sic_desc = _sic(cmap[ticker])
 
     series = {k: _annual(facts, us, ifrs) for k, (us, ifrs) in CONCEPTS.items()}
     if not series["N"]:
@@ -581,24 +604,41 @@ def load(ticker: str, n_years: int = 10):
                      "owners' earnings here are flattering rather than conservative.")
 
     g = lambda ks: (max(_instant(facts, ks).items(), default=(0, 0.0))[1]) / 1e6
-    net_cash = g(BALANCE["cash"]) + g(BALANCE["sti"]) + g(BALANCE["lti"]) \
-        - g(BALANCE["ltd"]) - g(BALANCE["std"])
+    cash_total = g(BALANCE["cash"]) + g(BALANCE["sti"]) + g(BALANCE["lti"])
+    debt_total = g(BALANCE["ltd"]) + g(BALANCE["std"])
+    net_cash = cash_total - debt_total
+    if is_financial(sic):
+        notes.append(f"{sic_desc or 'Financial company'} (SIC {sic}). Investments here back "
+                     "policyholder or depositor liabilities rather than belonging to "
+                     "shareholders, so net cash has been set to zero. The Tragic Algebra still "
+                     "works, but treat the valuation as indicative — this framework was built "
+                     "for software, and insurers, banks and REITs need book-value and "
+                     "combined-ratio thinking it does not contain.")
+        cash_total = debt_total = net_cash = 0.0
 
     # Most recent shares OUTSTANDING beats trailing weighted-average diluted.
     # Under a heavy buyback the weighted average is stale and systematically
     # high, which depresses every per-share figure. Adobe: 427M weighted vs
     # ~408M actual, a 4.7% error straight through to IV15.
+    # Shares outstanding is preferred (buybacks make the trailing weighted
+    # average stale), BUT under a dual-class structure the outstanding count is
+    # tagged per class and we may be seeing only one of them. Weighted-average
+    # diluted is reported consolidated, so when the two diverge by more than a
+    # buyback could explain, trust the diluted figure.
     sh = series.get("SHD", {})
-    diluted = 0.0
-    if shares_out:
-        diluted = shares_out[max(shares_out)] / 1e6
-    if diluted <= 0 and sh:
-        diluted = sh[max(sh)][2] / 1e6
-    if shares_out and sh and max(sh) in sh:
-        _wavg = sh[max(sh)][2] / 1e6
-        if _wavg > 0 and abs(diluted / _wavg - 1) > 0.03:
-            notes.append(f"Shares outstanding {diluted:,.1f}M vs weighted-average diluted "
-                         f"{_wavg:,.1f}M. Using the current count; buybacks make the average stale.")
+    outstanding = shares_out[max(shares_out)] / 1e6 if shares_out else 0.0
+    wavg = sh[max(sh)][2] / 1e6 if sh else 0.0
+    diluted = outstanding or wavg
+    if outstanding > 0 and wavg > 0:
+        if outstanding / wavg < 0.65:
+            diluted = wavg
+            notes.append(f"Shares outstanding read as {outstanding:,.1f}M but weighted-average "
+                         f"diluted is {wavg:,.1f}M — too big a gap for buybacks. This usually "
+                         "means multiple share classes and only one was picked up. Using the "
+                         "diluted figure; check it against the market cap below.")
+        elif abs(outstanding / wavg - 1) > 0.03:
+            notes.append(f"Shares outstanding {outstanding:,.1f}M vs weighted-average diluted "
+                         f"{wavg:,.1f}M. Using the current count; buybacks make the average stale.")
 
     rev = series.get("REV", {})
     ry = sorted(rev)
@@ -606,7 +646,9 @@ def load(ticker: str, n_years: int = 10):
     if len(ry) >= 4 and rev[ry[-4]][2] > 0 and rev[ry[-1]][2] > 0:
         growth = (rev[ry[-1]][2] / rev[ry[-4]][2]) ** (1 / 3) - 1
 
-    return years, notes, {"net_cash": net_cash, "shares": diluted, "growth": growth}
+    return years, notes, {"net_cash": net_cash, "cash": cash_total, "debt": debt_total,
+                          "shares": diluted, "growth": growth, "sic": sic,
+                          "sic_desc": sic_desc, "financial": is_financial(sic)}
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -671,10 +713,35 @@ with st.sidebar:
         for name, ok, got in self_test():
             st.write(("✅ " if ok else "❌ ") + f"{name} — {got}")
     st.divider()
+    with st.expander("What the numbers mean"):
+        st.markdown(
+            "**ΔE** — the share of each reported dollar of profit that actually reaches "
+            "shareholders once the true cost of stock compensation is charged. Below about "
+            "87%, a company needs 15% reported growth just to hold value per share steady.\n\n"
+            "**IV15** — the price at which the stock would return roughly 15% a year over "
+            "15+ years. A buy target from a cash flow model, not an earnings multiple.\n\n"
+            "**IV8 to IV10** — closer to what the business is actually worth. Buybacks below "
+            "that range add value per share; above it they destroy it.\n\n"
+            "**Expected return** — what today's price implies you'd earn annually, held long "
+            "term. The most useful single figure, since it needs no target return chosen "
+            "in advance.\n\n"
+            "**Moat tier** — sets how long growth lasts and how fast it fades, not the "
+            "starting rate. Fortress holds growth 8 years; Wood gets 2."
+        )
+    st.divider()
     st.caption(
-        "IV15 is the price giving about 15% a year over 15+ years — a buy target from a "
-        "multi-stage cash flow model, not an earnings multiple. Real intrinsic value sits "
-        "between IV8 and IV10."
+        "Research aid, not financial advice. Outputs depend on estimates you supply — change "
+        "the growth rate and the answer changes a lot. Method follows Michael Burry's published "
+        "writing; this tool is not affiliated with or endorsed by him."
+    )
+
+if "years" not in st.session_state:
+    st.info(
+        "**Reported profit is not what reaches you.** Shares handed to employees cost real "
+        "money the income statement never shows. This works out what is left, then the price "
+        "at which the stock would return about 15% a year over the long run.\n\n"
+        "Enter a US-listed ticker to start. Built for software and other operating companies — "
+        "banks, insurers and REITs need tools this one does not contain."
     )
 
 # A form submits on Enter as well as on the button click.
@@ -742,10 +809,15 @@ if years and ticker and st.session_state.get("tk") == ticker:
     growth = c2.number_input("Growth rate (%)", value=round(pre["growth"] * 100, 1), step=0.5,
                              help="Return on capital is the ceiling — nothing outgrows it "
                                   "forever.") / 100
-    net_cash = c3.number_input("Net cash ($M)", value=float(round(pre["net_cash"], 1)), step=10.0,
-                               help="Only what is freely deployable. Restricted, regulated and "
-                                    "operationally-tied cash funds the business.")
     price = c3.number_input("Price", value=float(current_price(tk) or 100.0), step=0.01)
+    cash = c3.number_input("Cash & investments ($M)", value=float(round(pre.get("cash", 0.0), 1)),
+                           step=10.0, help="Only what is freely deployable. Restricted, regulated "
+                                           "and operationally-tied cash funds the business.")
+    debt = c2.number_input("Total debt ($M)", value=float(round(pre.get("debt", 0.0), 1)),
+                           step=10.0, help="Short-term plus long-term borrowings. Subtracted from "
+                                           "cash to give the net figure added to intrinsic value.")
+    net_cash = cash - debt
+    c1.caption(f"Net cash {d(net_cash,0)}M  ·  {d(cash,0)}M cash less {d(debt,0)}M debt")
 
     with st.expander("Model settings"):
         m1, m2 = st.columns(2)
@@ -810,6 +882,17 @@ if years and ticker and st.session_state.get("tk") == ticker:
         st.error("Enter the diluted share count — everything divides by it.")
         st.stop()
 
+    mcap = shares * price / 1000.0
+    if net_cash > 0 and price > 0 and net_cash / (shares * price) > 0.60:
+        st.error(
+            f"**Check the share count before trusting anything below.** Net cash of "
+            f"{d(net_cash,0)}M is {net_cash/(shares*price):.0%} of a {d(mcap,2)}B market cap, "
+            "which almost never happens. The usual cause is a company with more than one share "
+            "class where only one was picked up. Look up the real share count and type it in.")
+    elif mcap < 0.05:
+        st.warning(f"Implied market cap is only {d(mcap,2)}B. If that looks too small, the share "
+                   "count is likely wrong — everything scales inversely with it.")
+
     par = IVParams(OE=OE, shares=shares, tier=tier_name, growth=growth,
                    net_cash=net_cash, exit_multiple=exit_m, blend=blend,
                    m2_style=m2_style)
@@ -831,19 +914,23 @@ if years and ticker and st.session_state.get("tk") == ticker:
     ratio = price / iv15
     er = expected_return(price, par)
     zn, kind = zone(ratio)
+    er_txt = "implausible" if er == float("inf") else f"{er:.1%}"
 
     v1, v2, v3 = st.columns(3)
     v1.metric("IV15", f"${iv15:,.2f}", f"market ${price:,.2f}")
     v2.metric("Price / IV15", f"{ratio:.2f}x", zn)
-    v3.metric("Expected return", f"{er:.1%}", f"score {valuation_points(ratio)}/35")
+    v3.metric("Expected return", er_txt, f"score {valuation_points(ratio)}/35")
+    if er == float("inf"):
+        st.error("Expected return came out beyond any believable range, which means an input is "
+                 "wrong rather than that a bargain has been found. Check the share count first.")
 
     verdict = {
         "success": f"**Fat pitch.** {tk} trades below its IV15 of {d(iv15)}, implying about "
-                   f"{er:.1%} a year held long term.",
+                   f"{er_txt} a year held long term.",
         "info":    f"**Just outside.** {tk} is at {ratio:.2f}x its IV15 of {d(iv15)} — a "
-                   f"watchlist candidate at about {er:.1%} a year.",
+                   f"watchlist candidate at about {er_txt} a year.",
         "error":   f"**Out field.** At {ratio:.2f}x its IV15 of {d(iv15)}, {tk} offers only "
-                   f"about {er:.1%} a year.",
+                   f"about {er_txt} a year.",
     }[kind]
     getattr(st, kind)(verdict)
 
