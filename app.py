@@ -740,9 +740,26 @@ def load(ticker: str, n_years: int = 10):
     rev = series.get("REV", {})
     ry = sorted(rev)
     latest_rev = rev[ry[-1]][2] / 1e6 if ry else 0.0
-    growth, raw_growth = 0.08, None
+    # Seed from the LATEST year-over-year rate, not a 3-year CAGR. A trailing
+    # CAGR averages in growth that has already ended: Paycom decelerated 23% ->
+    # 11% -> 9% -> 7%, and its 3-year CAGR still reads 8.9%. Forward-looking
+    # valuation should start from the most recent rate, with the CAGR shown
+    # alongside so the trend is visible.
+    growth, raw_growth, cagr3 = 0.08, None, None
+    if len(ry) >= 2 and rev[ry[-2]][2] > 0 and rev[ry[-1]][2] > 0:
+        raw_growth = rev[ry[-1]][2] / rev[ry[-2]][2] - 1
     if len(ry) >= 4 and rev[ry[-4]][2] > 0 and rev[ry[-1]][2] > 0:
-        raw_growth = (rev[ry[-1]][2] / rev[ry[-4]][2]) ** (1 / 3) - 1
+        cagr3 = (rev[ry[-1]][2] / rev[ry[-4]][2]) ** (1 / 3) - 1
+    if raw_growth is not None and cagr3 is not None and cagr3 - raw_growth > 0.05:
+        notes.append(
+            f"Revenue growth is decelerating — {cagr3:.1%} over three years but {raw_growth:.1%} "
+            "in the latest. The seed uses the recent rate. Burry typically goes lower still: he "
+            "projects owners' earnings, not revenue, and cuts further for competitive and AI-era "
+            "risk. For Paycom his figure implies about 3.5% against 7% recent revenue growth.")
+    elif raw_growth is not None and cagr3 is not None and raw_growth - cagr3 > 0.05:
+        notes.append(
+            f"Revenue growth is accelerating — {cagr3:.1%} over three years, {raw_growth:.1%} "
+            "in the latest. The seed uses the recent rate; satisfy yourself it is durable.")
         # A company emerging from near-zero revenue throws an enormous CAGR that
         # must never be compounded for fifteen years. Burry's rule is that ROIC
         # caps growth, and hypergrowth gets a separate short Stage 0 rather than
@@ -759,7 +776,7 @@ def load(ticker: str, n_years: int = 10):
     _kept_oe = sorted(y.OE for y in years[-5:] if not y.excluded)
     _med = _kept_oe[len(_kept_oe) // 2] if _kept_oe else 0.0
     return years, notes, {"net_cash": net_cash, "cash": cash_total, "debt": debt_total,
-                          "median_OE": _med, "revenue": latest_rev,
+                          "median_OE": _med, "revenue": latest_rev, "cagr3": cagr3,
                           "leases": lease_total,
                           "shares": diluted, "growth": growth, "sic": sic,
                           "sic_desc": sic_desc, "financial": is_financial(sic)}
@@ -1081,9 +1098,11 @@ if years and ticker and st.session_state.get("tk") == ticker:
     growth = c2.number_input(
         "Growth rate (%)", value=round(pre["growth"] * 100, 1), step=0.5,
         min_value=-50.0, max_value=60.0,
-        help="Growth in owners' earnings for the early years. Return on capital is the "
-             "ceiling — nothing outgrows it forever. For a genuine hypergrowth ramp use the "
-             "Stage 0 years in Model settings rather than pushing this number up.") / 100
+        help="Growth in owners' earnings for the early years, seeded from the most recent "
+             "year of revenue growth. Owners' earnings rarely grow at the revenue rate, and "
+             "return on capital is the ceiling. Burry generally sits well below the revenue "
+             "figure. For a genuine hypergrowth ramp use the Stage 0 years in Model settings "
+             "rather than raising this.") / 100
     price = c3.number_input("Price", value=float(current_price(tk) or 100.0), step=0.01)
     cash = c3.number_input("Cash & investments ($M)", value=float(round(pre.get("cash", 0.0), 1)),
                            step=10.0, help="Only what is freely deployable. Restricted, regulated "
@@ -1092,7 +1111,10 @@ if years and ticker and st.session_state.get("tk") == ticker:
                            step=10.0, help="Short-term plus long-term borrowings. Subtracted from "
                                            "cash to give the net figure added to intrinsic value.")
     net_cash = cash - debt
-    c1.caption(f"Net cash {d(net_cash,0)}M  ·  {d(cash,0)}M cash less {d(debt,0)}M debt")
+    _c3 = pre.get("cagr3")
+    _trend = (f"  ·  revenue {growth:.1%} latest vs {_c3:.1%} 3-yr"
+              if _c3 is not None else "")
+    c1.caption(f"Net cash {d(net_cash,0)}M  ·  {d(cash,0)}M cash less {d(debt,0)}M debt{_trend}")
 
     with st.expander("Model settings — what these do"):
         st.caption(
