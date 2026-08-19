@@ -881,9 +881,9 @@ if mode == "Watchlist":
                 except Exception as e:
                     failed.append(f"{tk_}: {e}")
             bar.empty()
-            st.session_state["screen"] = (rows, failed)
+            st.session_state["screen_results"] = (rows, failed)
 
-    rows, failed = st.session_state.get("screen", ([], []))
+    rows, failed = st.session_state.get("screen_results", ([], []))
     if rows:
         df = pd.DataFrame(rows).sort_values("ΔE full")
         st.dataframe(df.style.format({
@@ -1083,6 +1083,15 @@ if years and ticker and st.session_state.get("tk") == ticker:
         st.stop()
 
     mcap = shares * price / 1000.0
+    if fwd_N > 0 and shares > 0 and price > 0:
+        _pe = (shares * price) / fwd_N
+        if _pe > 150 or _pe < 2:
+            st.warning(
+                f"Forward net income of {d(fwd_N,0)}M against a {d(mcap,2)}B market cap is a "
+                f"P/E of {_pe:,.0f}x, which is almost certainly a reading error rather than a "
+                "valuation. Companies with large non-controlling interests report only the "
+                "parent's slice as net income while the share count covers everything. Check "
+                "the figure against the income statement and override it.")
     if net_cash > 0 and price > 0 and net_cash / (shares * price) > 0.60:
         st.error(
             f"**Check the share count before trusting anything below.** Net cash of "
@@ -1153,14 +1162,24 @@ if years and ticker and st.session_state.get("tk") == ticker:
     st.markdown("---")
     st.subheader("Shareholder quality")
 
+    dE_meaningful = -1.0 < pooled.dE <= 1.25
     q1, q2, q3 = st.columns(3)
-    q1.metric("Owners' earnings kept", f"{pooled.dE:.1%}" if abs(pooled.dE) < 10 else "deeply negative",
+    q1.metric("Owners' earnings kept",
+              f"{pooled.dE:.1%}" if abs(pooled.dE) < 10 else "deeply negative",
               f"last 3y: {recent.dE:.1%}")
     q2.metric("True SBC cost", f"${pooled.sum_omega:,.0f}M", f"GAAP says ${pooled.sum_G:,.0f}M")
     q3.metric("Value kept after 10y", f"{pooled.retention(10):.1%}" if 0 < pooled.dE <= 1.25 else "—",
               "of reported growth")
 
-    if pooled.tragic_tier:
+    if pooled.dE > 1.25:
+        st.warning(
+            f"**ΔE of {pooled.dE:.0%} is not a real result.** Keeping more than every reported "
+            "dollar is not something a company can do — it means the true SBC cost came out "
+            f"below the GAAP charge ({d(pooled.sum_omega,0)}M against {d(pooled.sum_G,0)}M), "
+            "which happens when share issuance is not being captured. Complex structures with "
+            "large non-controlling interests, several share classes, or units exchangeable into "
+            "stock are the usual causes. Read the shareholder verdict here as unknown, not good.")
+    elif pooled.tragic_tier:
         st.error("**Tragic tier.** Stock compensation cost more than the business earned over "
                  "this period. Shareholders were net funders of employee pay.")
     elif pooled.dE < 1 / 1.15:
