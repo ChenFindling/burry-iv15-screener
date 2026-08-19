@@ -9,7 +9,7 @@ Implements the full formula from *AP SBC: The Tragic Algebra Recurrence*, includ
 share-issuance term that pure-dilution companies need, and reproduces Burry's published
 figures exactly (see [Validation](#-validation)).
 
-🔗 **Live app:** [[tragic-algebra-analyzer.streamlit.app](https://tragic-algebra-analyzer.streamlit.app/)]
+🔗 **Live app:** [burry-iv15-screener.streamlit.app](https://burry-iv15-screener.streamlit.app/)
 
 ---
 
@@ -170,15 +170,36 @@ the judgement.
 
 ---
 
-## 🛠 Running locally
+## 🛠 Setup
+
+The SEC requires a real contact email in every request header and blocks generic user agents,
+so this must be set before anything will load. It is read from Streamlit secrets or an
+environment variable, never from the source, so it stays out of the repository.
+
+### Deployed on Streamlit Community Cloud
+App → Settings → Secrets:
+
+```toml
+sec_contact = "you@example.com"
+```
+
+### Running locally
 
 ```bash
 pip install -r requirements.txt
+export SEC_CONTACT="you@example.com"     # Windows: set SEC_CONTACT=you@example.com
 streamlit run app.py
 ```
 
-Put a real email address in `SEC_HEADERS` at the top of `app.py`. The SEC blocks generic user
-agents outright.
+Or create `.streamlit/secrets.toml` with the same `sec_contact` line — Streamlit reads it
+automatically. **Add `.streamlit/secrets.toml` to your `.gitignore`** so it is never
+committed.
+
+Use an address you actually monitor. The SEC's fair-access policy exists so they can contact
+you if an app misbehaves, and a dead address risks a block. A dedicated one is sensible, since
+anything in a public repo gets scraped.
+
+If the contact is missing the app shows a warning at the top and every lookup fails.
 
 Dependencies: `streamlit`, `pandas`, `requests`. Nothing else.
 
