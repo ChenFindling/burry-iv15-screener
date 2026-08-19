@@ -47,7 +47,7 @@ import streamlit as st
 
 SEC_HEADERS = {
     # Put your own email here. The SEC blocks generic user agents.
-    "User-Agent": "IV15 Research Tool contact@example.com",
+    "User-Agent": "IV15 Research Tool chenfind@hotmail.com",
     "Accept-Encoding": "gzip, deflate",
 }
 
@@ -1138,7 +1138,7 @@ if years and ticker and st.session_state.get("tk") == ticker:
                           if abs(_l1 - _l2) / max(_l1, 1) < 0.1 else
                           "They diverge, so the blend is doing real work — worth a look."))
 
-    _rev = prefill.get("revenue", 0.0)
+    _rev = pre.get("revenue", 0.0)
     if _rev > 0 and OE > 0:
         _margin = OE / _rev
         if _margin < 0.08 and growth > 0.12:
