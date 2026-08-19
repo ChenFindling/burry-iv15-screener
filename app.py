@@ -692,9 +692,21 @@ def load(ticker: str, n_years: int = 10):
 
     rev = series.get("REV", {})
     ry = sorted(rev)
-    growth = 0.08
+    growth, raw_growth = 0.08, None
     if len(ry) >= 4 and rev[ry[-4]][2] > 0 and rev[ry[-1]][2] > 0:
-        growth = (rev[ry[-1]][2] / rev[ry[-4]][2]) ** (1 / 3) - 1
+        raw_growth = (rev[ry[-1]][2] / rev[ry[-4]][2]) ** (1 / 3) - 1
+        # A company emerging from near-zero revenue throws an enormous CAGR that
+        # must never be compounded for fifteen years. Burry's rule is that ROIC
+        # caps growth, and hypergrowth gets a separate short Stage 0 rather than
+        # a decade of the launch rate.
+        growth = max(-0.10, min(raw_growth, 0.25))
+        if abs(raw_growth - growth) > 1e-9:
+            notes.append(
+                f"Three-year revenue growth is {raw_growth:.0%}, which is a launch rate, not a "
+                f"durable one — capped at {growth:.0%} for the seed. Nothing compounds at that "
+                "pace for fifteen years, and return on capital is the real ceiling. If the "
+                "surge is genuinely still ahead, use the hypergrowth years in Model settings "
+                "instead of raising this.")
 
     return years, notes, {"net_cash": net_cash, "cash": cash_total, "debt": debt_total,
                           "leases": lease_total,
@@ -931,9 +943,12 @@ if years and ticker and st.session_state.get("tk") == ticker:
                          help="Seeded from forward net income x ΔE. Adjust for maintenance "
                               "capex, working capital and anything non-recurring.")
     shares = c2.number_input("Diluted shares (M)", value=float(round(pre["shares"], 1)), step=1.0)
-    growth = c2.number_input("Growth rate (%)", value=round(pre["growth"] * 100, 1), step=0.5,
-                             help="Return on capital is the ceiling — nothing outgrows it "
-                                  "forever.") / 100
+    growth = c2.number_input(
+        "Growth rate (%)", value=round(pre["growth"] * 100, 1), step=0.5,
+        min_value=-50.0, max_value=60.0,
+        help="Growth in owners' earnings for the early years. Return on capital is the "
+             "ceiling — nothing outgrows it forever. For a genuine hypergrowth ramp use the "
+             "Stage 0 years in Model settings rather than pushing this number up.") / 100
     price = c3.number_input("Price", value=float(current_price(tk) or 100.0), step=0.01)
     cash = c3.number_input("Cash & investments ($M)", value=float(round(pre.get("cash", 0.0), 1)),
                            step=10.0, help="Only what is freely deployable. Restricted, regulated "
@@ -1059,9 +1074,17 @@ if years and ticker and st.session_state.get("tk") == ticker:
     v1.metric("IV15", f"${iv15:,.2f}", f"market ${price:,.2f}")
     v2.metric("Price / IV15", f"{ratio:.2f}x", zn)
     v3.metric("Expected return", er_txt, f"score {valuation_points(ratio)}/35")
-    if er == float("inf"):
-        st.error("Expected return came out beyond any believable range, which means an input is "
-                 "wrong rather than that a bargain has been found. Check the share count first.")
+    if er == float("inf") or (price > 0 and iv15 / price > 20):
+        st.error(
+            f"**This result is not believable — an input is wrong.** IV15 of {d(iv15)} against a "
+            f"{d(price)} share price is not a bargain, it is a broken assumption. The usual "
+            f"causes, in order: a growth rate far above anything sustainable (yours is "
+            f"{growth:.1%}); a share count that missed a second share class; or owners' earnings "
+            "carrying a one-off. Fix the input and the ladder below will mean something.")
+        with st.expander("Notes and detail", expanded=True):
+            for kind_, msg in alerts:
+                getattr(st, kind_)(msg)
+        st.stop()
 
     verdict = {
         "success": f"**Fat pitch.** {tk} trades below its IV15 of {d(iv15)}, implying about "
