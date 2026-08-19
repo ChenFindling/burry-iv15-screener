@@ -45,7 +45,7 @@ import streamlit as st
 
 SEC_HEADERS = {
     # Put your own email here. The SEC blocks generic user agents.
-    "User-Agent": "IV15 Research Tool contact@example.com",
+    "User-Agent": "IV15 Research Tool chenfind@hotmail.com",
     "Accept-Encoding": "gzip, deflate",
 }
 
