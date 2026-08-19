@@ -1309,7 +1309,7 @@ if years and ticker and st.session_state.get("tk") == ticker:
                 "Owners' earnings": "{:,.0f}", "ΔE": "{:.1%}"}, na_rep="—"),
             width='stretch', hide_index=True)
 
-        st.write("**Assumptions used** — paste this if something looks wrong")
+        st.write("**Assumptions used**")
         st.code(
             f"{tk}   price {price:,.2f}   shares {shares:,.1f}M   "
             f"mkt cap ${shares*price/1000:,.2f}B\n"
