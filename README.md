@@ -1,7 +1,13 @@
-# 🎯 Cassandra IV15 Screener & Tragic Algebra Engine
+# 🎯 Cassandra IV15 Analyzer
 
-A fundamental valuation engine implementing **Michael Burry's Tragic Algebra and AICT
-moat framework**, computed directly from audited SEC EDGAR XBRL filings.
+**Michael Burry's Tragic Algebra and IV15 owners' earnings framework, computed from audited
+SEC EDGAR filings.** A free stock valuation tool that measures the true cost of stock-based
+compensation — the cash spent on buybacks to offset employee grants, plus the market value of
+shares actually delivered — and prices the stock at a 15% required return.
+
+Implements the full formula from *AP SBC: The Tragic Algebra Recurrence*, including the
+share-issuance term that pure-dilution companies need, and reproduces Burry's published
+figures exactly (see [Validation](#-validation)).
 
 🔗 **Live app:** [burry-iv15-screener.streamlit.app](https://burry-iv15-screener.streamlit.app/)
 
@@ -135,7 +141,7 @@ the judgement.
 
 * **SEC EDGAR ingestion** — annual facts only, filtered on period duration and deduped by
   filing, with an IFRS fallback for foreign issuers. Rate-limited to ~6.7 req/s with backoff.
-* **Watchlist screening** — up to 25 tickers ranked by ΔE, with CSV export. IV15 appears only
+* **Watchlist mode** — up to 25 tickers ranked by ΔE, with CSV export. IV15 appears only
   where inputs pass every sanity check.
 * **Stress testing** — downgrade the tier and cut growth, then re-value.
 * **Calibration** — enter a published IV15 and solve for the growth it implies.
