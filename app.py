@@ -158,6 +158,7 @@ class Year:
     Ce: float = 0.0           # option / ESPP proceeds
     price: float = 0.0        # average share price for the year
     cash_settled_sbc: bool = False   # MELI-style: no equity gap to close
+    excluded: str = ""        # non-empty means capital formation, not pay
 
     @property
     def C(self) -> float:
@@ -226,6 +227,7 @@ def pool_recent(years: list[Year], n: int = 3) -> Pooled:
 
 
 def pool(years: list[Year]) -> Pooled:
+    years = [y for y in years if not y.excluded]
     sN = sum(y.N for y in years)
     if not years or sN == 0:
         raise ValueError("Not enough data to pool.")
@@ -636,10 +638,38 @@ def load(ticker: str, n_years: int = 10):
         years.append(Year(fy=fy, N=N / 1e6, G=get("G"), T=get("T"), dS=dS,
                           Cw=get("Cw"), Ce=get("Ce"), price=price))
 
+    # An IPO converts preferred to common and sells new stock in one go. Valuing
+    # that at the market price treats a capital raise as compensation, which is
+    # what drives absurd negative dE for recently listed companies. The tell is
+    # the first year a market price exists carrying a share jump no payroll
+    # could produce.
+    priced = [i for i, y in enumerate(years) if y.price > 0]
+    if priced:
+        i = priced[0]
+        base = shares_out.get(fys[i] - 1, 0.0) / 1e6 or abs(years[i].dS)
+        if base > 0 and years[i].dS / base > 0.25:
+            years[i].excluded = "listing year"
+            notes.append(
+                f"FY{years[i].fy} excluded — the share count jumped "
+                f"{years[i].dS / base:.0%} in the first year with a market price, which is a "
+                "listing rather than compensation. At IPO, preferred converts to common and new "
+                "stock is sold; pricing that as pay would make ΔE meaninglessly negative.")
+
     if non_sbc_total:
         notes.append(f"Excluded {non_sbc_total:,.1f}M shares issued for acquisitions, offerings "
                      "or conversions — those are corporate transactions, not compensation. "
                      "Where a company issues stock for deals this matters a great deal.")
+    _kept = [y for y in years if not y.excluded]
+    _sg = sum(y.G for y in _kept)
+    _som = sum(y.omega for y in _kept)
+    if _sg > 0 and _som / _sg > 4.0:
+        notes.append(
+            f"True SBC cost is {_som/_sg:.1f}x the GAAP charge. Across the whole NASDAQ-100 that "
+            "ratio is about 1.9x and the worst single name is 3.6x, so anything past roughly 4x "
+            "usually means shares issued for something other than pay — an offering, an "
+            "acquisition or a preferred conversion — are being counted as compensation. Treat ΔE "
+            "here as a floor, not a measurement.")
+
     if any(y.price == 0 for y in years):
         notes.append("No share price for some years — their SBC cost is understated.")
     if not any(y.Cw for y in years):
@@ -1154,7 +1184,8 @@ if years and ticker and st.session_state.get("tk") == ticker:
 
         st.write("**Year by year**")
         st.dataframe(pd.DataFrame([{
-            "FY": y.fy, "Net income": y.N, "GAAP SBC": y.G, "Buybacks": y.T,
+            "FY": f"{y.fy}*" if y.excluded else str(y.fy),
+            "Net income": y.N, "GAAP SBC": y.G, "Buybacks": y.T,
             "Share change": y.dS, "Avg price": y.price, "True SBC cost": y.omega,
             "Owners' earnings": y.OE, "ΔE": y.dE} for y in years]).style.format({
                 "Net income": "{:,.0f}", "GAAP SBC": "{:,.0f}", "Buybacks": "{:,.0f}",
