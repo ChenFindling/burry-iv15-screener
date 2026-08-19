@@ -45,7 +45,7 @@ import streamlit as st
 
 SEC_HEADERS = {
     # Put your own email here. The SEC blocks generic user agents.
-    "User-Agent": "IV15 Research Tool contact@example.com",
+    "User-Agent": "IV15 Research Tool chenfind@hotmail.com",
     "Accept-Encoding": "gzip, deflate",
 }
 
@@ -346,6 +346,15 @@ CONCEPTS = {
              "RevenueFromContractWithCustomerIncludingAssessedTax"], ["Revenue"]),
     "SHD": (["WeightedAverageNumberOfDilutedSharesOutstanding",
              "WeightedAverageNumberOfSharesOutstandingDiluted"], []),
+    # Shares issued for reasons that are NOT compensation. The extraction
+    # protocol excludes these from dS explicitly: M&A issuance, public
+    # offerings and debt-to-equity conversions are corporate transactions,
+    # not pay. Salesforce issued heavily for Slack, Tableau, MuleSoft and
+    # Informatica; charging those to employees makes dE far too negative.
+    "MA":   (["StockIssuedDuringPeriodSharesAcquisitions"], []),
+    "OFFER": (["StockIssuedDuringPeriodSharesNewIssues"], []),
+    "CONV": (["StockIssuedDuringPeriodSharesConversionOfConvertibleSecurities",
+              "StockIssuedDuringPeriodSharesConversionOfUnits"], []),
 }
 
 BALANCE = {
@@ -529,6 +538,7 @@ def load(ticker: str, n_years: int = 10):
 
     fys = sorted(series["N"])[-n_years:]
     notes: list[str] = list(split_notes)
+    non_sbc_total = 0.0
     years: list[Year] = []
 
     for fy in fys:
@@ -537,11 +547,20 @@ def load(ticker: str, n_years: int = 10):
 
         dS = ((shares_out[fy] - shares_out[fy - 1]) / 1e6
               if fy in shares_out and fy - 1 in shares_out else 0.0)
+        non_sbc = sum(abs(series[k][fy][2]) / 1e6
+                      for k in ("MA", "OFFER", "CONV") if fy in series.get(k, {}))
+        if non_sbc:
+            dS -= non_sbc
+            non_sbc_total += non_sbc
         price = _avg_price(closes, start, end) or 0.0
 
         years.append(Year(fy=fy, N=N / 1e6, G=get("G"), T=get("T"), dS=dS,
                           Cw=get("Cw"), Ce=get("Ce"), price=price))
 
+    if non_sbc_total:
+        notes.append(f"Excluded {non_sbc_total:,.1f}M shares issued for acquisitions, offerings "
+                     "or conversions — those are corporate transactions, not compensation. "
+                     "Where a company issues stock for deals this matters a great deal.")
     if any(y.price == 0 for y in years):
         notes.append("No share price for some years — their SBC cost is understated.")
     if not any(y.Cw for y in years):
@@ -645,11 +664,19 @@ with st.sidebar:
         "between IV8 and IV10."
     )
 
-ticker = st.text_input("Stock ticker", placeholder="ADBE · CRM · NOW · GOOGL").upper().strip()
-tier_name = st.selectbox("Moat tier", list(AICT), index=2,
-                         format_func=lambda t: f"{t} — {TIER_BLURB[t]}")
+# A form submits on Enter as well as on the button click.
+with st.form("lookup"):
+    ticker = st.text_input("Stock ticker",
+                           placeholder="ADBE · CRM · NOW · GOOGL — press Enter").upper().strip()
+    submitted = st.form_submit_button("Evaluate", type="primary")
 
-if st.button("Evaluate", type="primary"):
+tier_name = st.selectbox("Moat tier", list(AICT), index=2,
+                         format_func=lambda t: f"{t} — {TIER_BLURB[t]}",
+                         help="Sets stage lengths, how far growth fades in stage 2, the terminal "
+                              "cap and the exit multiple. It does NOT set your stage 1 growth "
+                              "rate — that is company-specific and yours to judge.")
+
+if submitted:
     if not ticker:
         st.warning("Enter a ticker first.")
     else:
@@ -686,7 +713,15 @@ if years and ticker and st.session_state.get("tk") == ticker:
     c1, c2, c3 = st.columns(3)
     fwd_N = c1.number_input("Forward net income ($M)", value=float(round(years[-1].N, 1)), step=10.0,
                             help="Next year's expected GAAP net income.")
-    derived = fwd_N * use_dE if dE_ok else max(median_OE, 0.0)
+    if dE_ok:
+        derived = fwd_N * use_dE
+    elif median_OE > 0:
+        derived = median_OE
+    else:
+        # Every recent year is negative. Seeding zero makes IV15 collapse to
+        # net cash per share, which looks like an answer but is not one.
+        # Forward net income is at least a defensible ceiling to revise down from.
+        derived = fwd_N
     OE = c1.number_input("Owners' earnings ($M)", value=float(round(derived, 1)), step=1.0,
                          help="Seeded from forward net income x ΔE. Adjust for maintenance "
                               "capex, working capital and anything non-recurring.")
@@ -720,6 +755,15 @@ if years and ticker and st.session_state.get("tk") == ticker:
                        + ("They agree closely, so the blend barely matters here."
                           if abs(_l1 - _l2) / max(_l1, 1) < 0.1 else
                           "They diverge, so the blend is doing real work — worth a look."))
+
+    if not dE_ok and median_OE <= 0:
+        st.error(
+            f"**Set owners' earnings yourself.** ΔE of {use_dE:.1%} cannot be projected, and "
+            "every recent year is negative too, so the field below is seeded with forward net "
+            f"income of {d(fwd_N,0)}M as a ceiling — it is certainly too high. Burry does this "
+            "by hand: ServiceNow gets about 620M against reported profit near 1,750M, adjusted "
+            "upward from a negative ΔE for its dilution-neutral pledge and its sub-10%-of-revenue "
+            "SBC target.")
 
     if not dE_ok:
         alerts.append(("error",
