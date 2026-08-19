@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import datetime as dt
 import statistics
+import threading
+import time
 from dataclasses import dataclass, field
 
 import pandas as pd
@@ -45,9 +47,43 @@ import streamlit as st
 
 SEC_HEADERS = {
     # Put your own email here. The SEC blocks generic user agents.
-    "User-Agent": "IV15 Research Tool chenfind@hotmail.com",
+    "User-Agent": "IV15 Research Tool contact@example.com",
     "Accept-Encoding": "gzip, deflate",
 }
+
+# SEC allows 10 requests/second per user agent and blocks offenders. One person
+# clicking around never gets close; ten people sharing an app, or one watchlist
+# run, easily does. All SEC traffic funnels through _sec_get, which spaces
+# requests process-wide and backs off when throttled.
+_SEC_MIN_INTERVAL = 0.15          # ~6.7 req/s, comfortably inside the limit
+_sec_lock = threading.Lock()
+_sec_last = [0.0]
+
+
+def _sec_get(url: str, timeout: int = 25) -> requests.Response:
+    for attempt in range(4):
+        with _sec_lock:
+            wait = _SEC_MIN_INTERVAL - (time.monotonic() - _sec_last[0])
+            if wait > 0:
+                time.sleep(wait)
+            _sec_last[0] = time.monotonic()
+        try:
+            r = requests.get(url, headers=SEC_HEADERS, timeout=timeout)
+        except requests.RequestException:
+            if attempt == 3:
+                raise
+            time.sleep(2 ** attempt)
+            continue
+        if r.status_code == 200:
+            return r
+        if r.status_code in (403, 429, 502, 503):
+            time.sleep(2 ** attempt)          # 1s, 2s, 4s
+            continue
+        r.raise_for_status()
+    raise RuntimeError(
+        "SEC is throttling this app. Wait a minute and try again. If it keeps happening, "
+        "check that SEC_HEADERS at the top of the file has a real email address in it — "
+        "the SEC blocks generic user agents outright.")
 
 
 @dataclass(frozen=True)
@@ -382,6 +418,10 @@ BALANCE = {
              "AvailableForSaleSecuritiesDebtSecuritiesNoncurrent"],
     "ltd":  ["LongTermDebtNoncurrent", "LongTermDebt"],
     "std":  ["LongTermDebtCurrent", "DebtCurrent", "ShortTermBorrowings", "CommercialPaper"],
+    # Not debt in Burry's sense — his ROIC formula subtracts long-term operating
+    # leases from capital rather than treating them as borrowings. Shown so a
+    # retailer's zero-debt line doesn't look like a failed lookup.
+    "lease": ["OperatingLeaseLiabilityNoncurrent", "OperatingLeaseLiability"],
 }
 
 ANNUAL_FORMS = ("10-K", "10-K/A", "20-F", "40-F")
@@ -389,9 +429,7 @@ ANNUAL_FORMS = ("10-K", "10-K/A", "20-F", "40-F")
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def _ticker_map() -> dict[str, str]:
-    r = requests.get("https://www.sec.gov/files/company_tickers.json",
-                     headers=SEC_HEADERS, timeout=15)
-    r.raise_for_status()
+    r = _sec_get("https://www.sec.gov/files/company_tickers.json", timeout=15)
     return {e["ticker"].upper(): str(e["cik_str"]).zfill(10) for e in r.json().values()}
 
 
@@ -399,9 +437,7 @@ def _ticker_map() -> dict[str, str]:
 def _sic(cik: str) -> tuple[str, str]:
     """SIC code and description, for sector-specific guards."""
     try:
-        r = requests.get(f"https://data.sec.gov/submissions/CIK{cik}.json",
-                         headers=SEC_HEADERS, timeout=20)
-        j = r.json()
+        j = _sec_get(f"https://data.sec.gov/submissions/CIK{cik}.json", timeout=20).json()
         return str(j.get("sic", "")), str(j.get("sicDescription", ""))
     except Exception:
         return "", ""
@@ -416,10 +452,8 @@ def is_financial(sic: str) -> bool:
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def _facts(cik: str) -> dict:
-    r = requests.get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
-                     headers=SEC_HEADERS, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    return _sec_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
+                    timeout=30).json()
 
 
 def _annual(facts: dict, us: list[str], ifrs: list[str]) -> dict[int, tuple[str, str, float]]:
@@ -454,12 +488,19 @@ def _annual(facts: dict, us: list[str], ifrs: list[str]) -> dict[int, tuple[str,
 
 
 def _instant(facts: dict, concepts: list[str], unit: str = "USD") -> dict[int, float]:
-    out: dict[int, tuple[str, float]] = {}
+    """Latest balance-sheet value per fiscal year.
+
+    Concepts are tried in order and the FIRST one with data wins. Merging them
+    silently mixes incompatible definitions — CashAndCashEquivalents and
+    CashCashEquivalentsRestrictedCash differ by the restricted balance, which
+    is not shareholder money.
+    """
     for taxonomy in ("us-gaap", "dei", "ifrs-full"):
         tax = facts.get("facts", {}).get(taxonomy, {})
         for concept in concepts:
             if concept not in tax:
                 continue
+            out: dict[int, tuple[str, float]] = {}
             for row in tax[concept].get("units", {}).get(unit, []):
                 if row.get("start") or not row.get("end"):
                     continue
@@ -468,7 +509,9 @@ def _instant(facts: dict, concepts: list[str], unit: str = "USD") -> dict[int, f
                 fy, filed = int(row["end"][:4]), row.get("filed", "")
                 if fy not in out or filed > out[fy][0]:
                     out[fy] = (filed, float(row["val"]))
-    return {k: v[1] for k, v in out.items()}
+            if out:
+                return {k: v[1] for k, v in out.items()}
+    return {}
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -606,7 +649,14 @@ def load(ticker: str, n_years: int = 10):
     g = lambda ks: (max(_instant(facts, ks).items(), default=(0, 0.0))[1]) / 1e6
     cash_total = g(BALANCE["cash"]) + g(BALANCE["sti"]) + g(BALANCE["lti"])
     debt_total = g(BALANCE["ltd"]) + g(BALANCE["std"])
+    lease_total = g(BALANCE["lease"])
     net_cash = cash_total - debt_total
+    if debt_total == 0 and lease_total > 0:
+        notes.append(f"No funded debt found, which for many retailers and restaurant chains is "
+                     f"simply true. It does carry {lease_total:,.0f}M of long-term operating "
+                     "lease obligations — real commitments, but Burry's framework handles leases "
+                     "inside the capital base rather than as borrowings, so they are not "
+                     "subtracted here.")
     if is_financial(sic):
         notes.append(f"{sic_desc or 'Financial company'} (SIC {sic}). Investments here back "
                      "policyholder or depositor liabilities rather than belonging to "
@@ -647,6 +697,7 @@ def load(ticker: str, n_years: int = 10):
         growth = (rev[ry[-1]][2] / rev[ry[-4]][2]) ** (1 / 3) - 1
 
     return years, notes, {"net_cash": net_cash, "cash": cash_total, "debt": debt_total,
+                          "leases": lease_total,
                           "shares": diluted, "growth": growth, "sic": sic,
                           "sic_desc": sic_desc, "financial": is_financial(sic)}
 
@@ -735,13 +786,87 @@ with st.sidebar:
         "writing; this tool is not affiliated with or endorsed by him."
     )
 
+mode = st.radio("mode", ["Single stock", "Watchlist"], horizontal=True,
+                label_visibility="collapsed")
+
+# ══════════════════════════════════════════════════════════════════════
+#  WATCHLIST — screens on Tragic Algebra alone, which needs no judgement
+# ══════════════════════════════════════════════════════════════════════
+if mode == "Watchlist":
+    st.caption(
+        "ΔE needs no assumptions from you — it is arithmetic on the filings. That makes it the "
+        "one thing here worth running across a whole list at once. Ranked worst first, because "
+        "the bottom of this table is where the money quietly leaves."
+    )
+    raw = st.text_area("Tickers", placeholder="ADBE, CRM, NOW, GOOGL, META, WDAY",
+                       help="Separated by commas, spaces or new lines. Up to 25.")
+    if st.button("Screen", type="primary"):
+        tickers = [t.strip().upper() for t in raw.replace(",", " ").replace("\n", " ").split()]
+        tickers = list(dict.fromkeys([t for t in tickers if t]))[:25]
+        if not tickers:
+            st.warning("Enter at least one ticker.")
+        else:
+            rows, failed, bar = [], [], st.progress(0.0, "Reading filings…")
+            for i, tk_ in enumerate(tickers):
+                bar.progress((i + 1) / len(tickers), f"{tk_} ({i+1} of {len(tickers)})")
+                try:
+                    ys, _, pf = load(tk_, 10)
+                    full = pool(ys)
+                    rec = pool_recent(ys, 3) if len(ys) >= 3 else full
+                    latest = ys[-1]
+                    rows.append({
+                        "Ticker": tk_,
+                        "ΔE full": full.dE,
+                        "ΔE 3y": rec.dE,
+                        "Owners' earnings": latest.OE,
+                        "True SBC cost": full.sum_omega,
+                        "GAAP says": full.sum_G,
+                        "GAAP overstates": full.gaap_overstatement,
+                        "Verdict": ("Tragic tier" if full.tragic_tier
+                                    else "Below break-even" if full.dE < 1 / 1.15
+                                    else "Passes"),
+                    })
+                except Exception as e:
+                    failed.append(f"{tk_}: {e}")
+            bar.empty()
+            st.session_state["screen"] = (rows, failed)
+
+    rows, failed = st.session_state.get("screen", ([], []))
+    if rows:
+        df = pd.DataFrame(rows).sort_values("ΔE full")
+        st.dataframe(df.style.format({
+            "ΔE full": "{:.1%}", "ΔE 3y": "{:.1%}", "Owners' earnings": "{:,.0f}",
+            "True SBC cost": "{:,.0f}", "GAAP says": "{:,.0f}",
+            "GAAP overstates": "{:.1%}"}, na_rep="—"),
+            width="stretch", hide_index=True)
+
+        n_tragic = sum(r["Verdict"] == "Tragic tier" for r in rows)
+        n_below = sum(r["Verdict"] == "Below break-even" for r in rows)
+        k = st.columns(3)
+        k[0].metric("Screened", len(rows))
+        k[1].metric("Below 87% break-even", n_below + n_tragic)
+        k[2].metric("Tragic tier", n_tragic)
+        st.caption(
+            "Below 87%, a company needs 15% reported growth just to hold intrinsic value per "
+            "share steady. Tragic tier means owners' earnings were negative across the whole "
+            "window — shareholders funded employee pay. Open any name in Single stock to value it."
+        )
+        st.download_button("Download CSV", df.to_csv(index=False),
+                           "tragic-algebra-screen.csv", "text/csv")
+    if failed:
+        with st.expander(f"{len(failed)} could not be read"):
+            for f in failed:
+                st.write("· " + f)
+    st.stop()
+
 if "years" not in st.session_state:
     st.info(
         "**Reported profit is not what reaches you.** Shares handed to employees cost real "
         "money the income statement never shows. This works out what is left, then the price "
         "at which the stock would return about 15% a year over the long run.\n\n"
-        "Enter a US-listed ticker to start. Built for software and other operating companies — "
-        "banks, insurers and REITs need tools this one does not contain."
+        "Enter a US-listed ticker to start, or switch to Watchlist to screen many at once. "
+        "Built for software and other operating companies — banks, insurers and REITs need "
+        "tools this one does not contain."
     )
 
 # A form submits on Enter as well as on the button click.
@@ -819,7 +944,21 @@ if years and ticker and st.session_state.get("tk") == ticker:
     net_cash = cash - debt
     c1.caption(f"Net cash {d(net_cash,0)}M  ·  {d(cash,0)}M cash less {d(debt,0)}M debt")
 
-    with st.expander("Model settings"):
+    with st.expander("Model settings — what these do"):
+        st.caption(
+            "Burry builds IV15 from two models and blends them. Everything else in this app is "
+            "calculated; these three are judgement, and he has never published his choices.\n\n"
+            "**Exit multiple** — what the business might fetch in year 15, as a multiple of its "
+            "owners' earnings then. Higher for durable businesses, lower for fading ones.\n\n"
+            "**Exit-multiple leg** — how that year-15 sale is combined with the cash the business "
+            "throws off along the way. *Cash flows + exit* counts both, and fits Salesforce, "
+            "Adobe and Paycom. *Buy and hold* counts only the year-15 sale, as if you bought the "
+            "whole company and let it reinvest everything; it is the only reading that reaches "
+            "Paylocity's published figure. Leave it on the first unless you are testing.\n\n"
+            "**Long-horizon weight** — 1.0 uses only the model that runs to a perpetuity, 0.0 "
+            "only the exit-multiple model, 0.5 splits them. This moves the answer a great deal, "
+            "which is a fair reflection of how uncertain it genuinely is."
+        )
         m1, m2 = st.columns(2)
         exit_m = m1.number_input(
             "Exit multiple", value=round(AICT[tier_name].default_exit_multiple, 2), step=0.5,
@@ -939,7 +1078,7 @@ if years and ticker and st.session_state.get("tk") == ticker:
         pd.DataFrame([{"Target return": f"{n}%", "Buy under": v, "Meaning": RUNG_MEANING[n]}
                       for n, v in lad.items() if v == v and v > 0][::-1])
         .style.format({"Buy under": "${:,.2f}"}),
-        use_container_width=True, hide_index=True)
+        width='stretch', hide_index=True)
 
     # ══ quality ══════════════════════════════════════════════════════
     st.markdown("---")
@@ -998,7 +1137,7 @@ if years and ticker and st.session_state.get("tk") == ticker:
                 "Net income": "{:,.0f}", "GAAP SBC": "{:,.0f}", "Buybacks": "{:,.0f}",
                 "Share change": "{:+,.1f}", "Avg price": "${:,.2f}", "True SBC cost": "{:,.0f}",
                 "Owners' earnings": "{:,.0f}", "ΔE": "{:.1%}"}, na_rep="—"),
-            use_container_width=True, hide_index=True)
+            width='stretch', hide_index=True)
 
         st.write("**Assumptions used** — paste this if something looks wrong")
         st.code(
