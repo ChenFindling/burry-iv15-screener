@@ -743,7 +743,10 @@ def load(ticker: str, n_years: int = 10):
                 "surge is genuinely still ahead, use the hypergrowth years in Model settings "
                 "instead of raising this.")
 
+    _kept_oe = sorted(y.OE for y in years[-5:] if not y.excluded)
+    _med = _kept_oe[len(_kept_oe) // 2] if _kept_oe else 0.0
     return years, notes, {"net_cash": net_cash, "cash": cash_total, "debt": debt_total,
+                          "median_OE": _med,
                           "leases": lease_total,
                           "shares": diluted, "growth": growth, "sic": sic,
                           "sic_desc": sic_desc, "financial": is_financial(sic)}
@@ -851,6 +854,11 @@ if mode == "Watchlist":
         raw = st.text_area("Tickers", placeholder="ADBE, CRM, NOW, GOOGL, META, WDAY",
                            help="Separated by commas, spaces or new lines. Up to 25. "
                                 "Ctrl+Enter to run.")
+        w_tier = st.selectbox(
+            "Assume this tier for every name", list(AICT), index=2,
+            format_func=lambda t: f"{t} — {TIER_BLURB[t]}",
+            help="Tier is a per-company judgement, so one setting across a list is a rough "
+                 "cut. Open anything interesting in Single stock and set its tier properly.")
         screen = st.form_submit_button("Screen", type="primary")
     if screen:
         tickers = [t.strip().upper() for t in raw.replace(",", " ").replace("\n", " ").split()]
@@ -866,6 +874,38 @@ if mode == "Watchlist":
                     full = pool(ys)
                     rec = pool_recent(ys, 3) if len(ys) >= 3 else full
                     latest = ys[-1]
+                    px_ = current_price(tk_) or 0.0
+                    sh_ = pf.get("shares") or 0.0
+                    fwd_ = latest.N
+
+                    # IV15 is only shown where the automatic inputs can be
+                    # trusted. Printing a confident number for a company whose
+                    # earnings base is broken is worse than printing nothing.
+                    iv, pv, er_, why = None, None, None, ""
+                    use = rec.dE if 0 < rec.dE <= 1.25 else (full.dE if 0 < full.dE <= 1.25 else None)
+                    oe_ = fwd_ * use if use else (pf.get("median_OE") or 0.0)
+                    if pf.get("financial"):
+                        why = "financial — framework does not apply"
+                    elif sh_ <= 0 or px_ <= 0:
+                        why = "no share count or price"
+                    elif oe_ <= 0:
+                        why = "owners' earnings need setting by hand"
+                    elif not (2 <= (sh_ * px_) / fwd_ <= 150 if fwd_ > 0 else False):
+                        why = "earnings base looks misread"
+                    else:
+                        p_ = IVParams(OE=oe_, shares=sh_, tier=w_tier,
+                                      growth=pf.get("growth", 0.08),
+                                      net_cash=pf.get("net_cash", 0.0),
+                                      exit_multiple=AICT[w_tier].default_exit_multiple,
+                                      blend=0.5)
+                        iv = intrinsic_value(p_, 15)
+                        if iv != iv or iv <= 0 or px_ / iv > 20:
+                            iv, why = None, "inputs give an implausible value"
+                        else:
+                            pv = px_ / iv
+                            e = expected_return(px_, p_)
+                            er_ = None if e == float("inf") else e
+
                     rows.append({
                         "Ticker": tk_,
                         "ΔE full": full.dE,
@@ -873,10 +913,15 @@ if mode == "Watchlist":
                         "Owners' earnings": latest.OE,
                         "True SBC cost": full.sum_omega,
                         "GAAP says": full.sum_G,
-                        "GAAP overstates": full.gaap_overstatement,
+                        "Price": px_ or None,
+                        "IV15": iv,
+                        "P/IV15": pv,
+                        "Expected return": er_,
                         "Verdict": ("Tragic tier" if full.tragic_tier
+                                    else "ΔE not meaningful" if full.dE > 1.25
                                     else "Below break-even" if full.dE < 1 / 1.15
                                     else "Passes"),
+                        "IV15 note": why,
                     })
                 except Exception as e:
                     failed.append(f"{tk_}: {e}")
@@ -888,8 +933,8 @@ if mode == "Watchlist":
         df = pd.DataFrame(rows).sort_values("ΔE full")
         st.dataframe(df.style.format({
             "ΔE full": "{:.1%}", "ΔE 3y": "{:.1%}", "Owners' earnings": "{:,.0f}",
-            "True SBC cost": "{:,.0f}", "GAAP says": "{:,.0f}",
-            "GAAP overstates": "{:.1%}"}, na_rep="—"),
+            "True SBC cost": "{:,.0f}", "GAAP says": "{:,.0f}", "Price": "${:,.2f}",
+            "IV15": "${:,.2f}", "P/IV15": "{:.2f}x", "Expected return": "{:.1%}"}, na_rep="—"),
             width="stretch", hide_index=True)
 
         n_tragic = sum(r["Verdict"] == "Tragic tier" for r in rows)
@@ -899,9 +944,14 @@ if mode == "Watchlist":
         k[1].metric("Below 87% break-even", n_below + n_tragic)
         k[2].metric("Tragic tier", n_tragic)
         st.caption(
+            "ΔE is arithmetic and can be trusted. **IV15 here is indicative only** — it uses one "
+            "tier for every name, growth seeded from revenue, and owner earnings straight from "
+            "ΔE, with no normalising. It is blank wherever those inputs cannot be trusted, and "
+            "the reason is in the last column. Treat it as a sort order, not a valuation, and "
+            "open anything interesting in Single stock.\n\n"
             "Below 87%, a company needs 15% reported growth just to hold intrinsic value per "
             "share steady. Tragic tier means owners' earnings were negative across the whole "
-            "window — shareholders funded employee pay. Open any name in Single stock to value it."
+            "window — shareholders funded employee pay."
         )
         st.download_button("Download CSV", df.to_csv(index=False),
                            "tragic-algebra-screen.csv", "text/csv")
