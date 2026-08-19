@@ -32,6 +32,7 @@ Run:  streamlit run app.py
 from __future__ import annotations
 
 import datetime as dt
+import os
 import statistics
 import threading
 import time
@@ -45,9 +46,22 @@ import streamlit as st
 #  CONSTANTS
 # ══════════════════════════════════════════════════════════════════════
 
+# The SEC requires a real contact address in the User-Agent and blocks generic
+# ones. Keep it OUT of the repo: set it in Streamlit secrets (Settings →
+# Secrets) as   sec_contact = "you@example.com"   and it never appears in your
+# source. Falls back to an environment variable for local runs.
+def _sec_contact() -> str:
+    try:
+        v = st.secrets.get("sec_contact", "")
+        if v:
+            return str(v)
+    except Exception:
+        pass
+    return os.environ.get("SEC_CONTACT", "")
+
+
 SEC_HEADERS = {
-    # Put your own email here. The SEC blocks generic user agents.
-    "User-Agent": "IV15 Research Tool chenfind@hotmail.com",
+    "User-Agent": f"Tragic Algebra Analyzer {_sec_contact() or 'contact-not-set'}",
     "Accept-Encoding": "gzip, deflate",
 }
 
@@ -201,6 +215,17 @@ class Pooled:
     @property
     def street_overstatement(self) -> float:
         return self.sum_omega / self.sum_OE if self.sum_OE else float("nan")
+
+    @property
+    def dE_defined(self) -> bool:
+        """dE = OE/N only means something when N is positive.
+
+        With a negative denominator the sign flips and a loss-making company
+        that ALSO bled value to stock comp reports a healthy-looking positive
+        ratio. HubSpot: cumulative net income -$587M, owners' earnings
+        -$3,964M, dE = +675%. Read naively that looks excellent. It is the
+        opposite."""
+        return self.sum_N > 0
 
     @property
     def tragic_tier(self) -> bool:
@@ -583,6 +608,10 @@ def split_adjust(shares: dict[int, float]) -> tuple[dict[int, float], list[str]]
             # prior year re-detects the same split on every pass and compounds
             # the factor geometrically.
             ratio = shares[fy] / shares[fys[i - 1]]
+            # A share count that MULTIPLIES from a small base is usually a
+            # listing, not a split. Splits move a large, established count.
+            if ratio > 2.85 and shares[fys[i - 1]] < 25e6:
+                continue
             if ratio > 0 and (ratio > 2.85 or ratio < 0.35):
                 # Round to a plausible split ratio. Reverse splits must be
                 # rounded on the reciprocal: round(0.1 * 2) / 2 is zero.
@@ -887,6 +916,14 @@ with st.sidebar:
         "writing; this tool is not affiliated with or endorsed by him."
     )
 
+if not _sec_contact():
+    st.warning(
+        "**No SEC contact address set.** The SEC requires a real email in the request header "
+        "and blocks generic user agents, so lookups will fail. Add `sec_contact = "
+        "\"you@example.com\"` in Streamlit Settings → Secrets, or set a SEC_CONTACT "
+        "environment variable locally."
+    )
+
 mode = st.radio("mode", ["Single stock", "Watchlist"], horizontal=True,
                 label_visibility="collapsed")
 
@@ -1184,17 +1221,24 @@ if years and ticker and st.session_state.get("tk") == ticker:
             "SBC target.")
 
     if not dE_ok:
+        if use_dE < 0:
+            _why = ("stock compensation has swamped earnings over this window")
+        elif use_dE > 1.25:
+            _why = ("the ratio is above 100%, which means either the denominator was negative "
+                    "or share issuance is not being captured — either way it cannot be projected")
+        else:
+            _why = "the ratio is zero or undefined"
         alerts.append(("error",
-            f"ΔE of {use_dE:.1%} cannot be projected forward — stock compensation has swamped "
-            "earnings over this window. Set owners' earnings by hand. Burry does exactly this "
-            "for DocuSign: ΔE deeply negative, yet about 195M of forward owners' earnings on "
-            "judgement, worked down from free cash flow."))
+            f"ΔE of {use_dE:.1%} cannot be projected forward — {_why}. Set owners' earnings by "
+            "hand. Burry does exactly this for DocuSign: ΔE deeply negative, yet about 195M of "
+            "forward owners' earnings on judgement, worked down from free cash flow."))
     elif median_OE > 0 and derived > 2 * median_OE:
         alerts.append(("warning",
             f"Derived owners' earnings of {d(derived,0)}M are {derived/median_OE:.1f}x the "
             f"{d(median_OE,0)}M median of the last five years. Forward profit may carry a "
             "one-off. Check the yearly table and override."))
-    if abs(recent.dE - pooled.dE) > 0.15:
+    if pooled.dE_defined and recent.dE_defined and abs(recent.dE - pooled.dE) > 0.15 \
+            and abs(pooled.dE) <= 1.25 and abs(recent.dE) <= 1.25:
         alerts.append(("warning",
             f"Regime change: ΔE was {pooled.dE:.1%} over {pooled.years} years but "
             f"{recent.dE:.1%} over the last three. Satisfy yourself the shift is durable."))
@@ -1287,16 +1331,20 @@ if years and ticker and st.session_state.get("tk") == ticker:
     st.markdown("---")
     st.subheader("Shareholder quality")
 
-    dE_meaningful = -1.0 < pooled.dE <= 1.25
     q1, q2, q3 = st.columns(3)
-    q1.metric("Owners' earnings kept",
-              f"{pooled.dE:.1%}" if abs(pooled.dE) < 10 else "deeply negative",
-              f"last 3y: {recent.dE:.1%}")
+    if not pooled.dE_defined:
+        q1.metric("Owners' earnings kept", "n/a", "net income was negative")
+    else:
+        q1.metric("Owners' earnings kept",
+                  f"{pooled.dE:.1%}" if abs(pooled.dE) < 10 else "deeply negative",
+                  f"last 3y: {recent.dE:.1%}" if recent.dE_defined else "last 3y: n/a")
     q2.metric("True SBC cost", f"${pooled.sum_omega:,.0f}M", f"GAAP says ${pooled.sum_G:,.0f}M")
-    q3.metric("Value kept after 10y", f"{pooled.retention(10):.1%}" if 0 < pooled.dE <= 1.25 else "—",
+    q3.metric("Value kept after 10y",
+              f"{pooled.retention(10):.1%}"
+              if pooled.dE_defined and 0 < pooled.dE <= 1.25 else "—",
               "of reported growth")
 
-    if pooled.sum_OE < 0 and price > 0:
+    if pooled.sum_OE < 0 and pooled.dE_defined and price > 0:
         st.info(
             "Owners' earnings are negative over this window. Burry still publishes IV15 values for "
             "such companies — Zscaler, Palo Alto and CrowdStrike all have negative owners' earnings "
@@ -1305,7 +1353,16 @@ if years and ticker and st.session_state.get("tk") == ticker:
             "earnings you think the business reaches, and use the hypergrowth years to model the "
             "path. This tool cannot infer that path for you.")
 
-    if pooled.dE > 1.25:
+    if not pooled.dE_defined:
+        st.error(
+            f"**ΔE cannot be computed — cumulative net income is negative** "
+            f"({d(pooled.sum_N,0)}M over {pooled.years} years). Any ratio printed against a "
+            f"negative denominator flips sign and misleads. What matters instead is the absolute "
+            f"figure: owners' earnings of {d(pooled.sum_OE,0)}M after a true stock-comp cost of "
+            f"{d(pooled.sum_omega,0)}M. The business lost money and lost more again to "
+            "compensation. Set owners' earnings by hand from what you think it earns once "
+            "profitable.")
+    elif pooled.dE > 1.25:
         st.warning(
             f"**ΔE of {pooled.dE:.0%} is not a real result.** Keeping more than every reported "
             "dollar is not something a company can do — it means the true SBC cost came out "
