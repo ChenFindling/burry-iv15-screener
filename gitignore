@@ -1,0 +1,15 @@
+# Never commit secrets — this file holds your SEC contact address
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
