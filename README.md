@@ -1,4 +1,4 @@
-# 🎯 Cassandra IV15 Analyzer
+# 🎯 Tragic Algebra Analyzer
 
 **Michael Burry's Tragic Algebra and IV15 owners' earnings framework, computed from audited
 SEC EDGAR filings.** A free stock valuation tool that measures the true cost of stock-based
