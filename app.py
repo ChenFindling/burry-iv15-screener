@@ -567,6 +567,10 @@ def split_adjust(shares: dict[int, float]) -> tuple[dict[int, float], list[str]]
     V = T + P x dS, the SBC cost explodes. ServiceNow's 5-for-1 turned a
     pooled dE of about -79% into -2391%.
     """
+    # Drop non-positive entries first. Dual-class filers report each class
+    # separately and a class can read as zero in some years; a zero here made
+    # the reverse-split branch compute 1/0.
+    shares = {k: v for k, v in shares.items() if v and v > 0}
     fys, notes = sorted(shares), []
     if len(fys) < 2:
         return dict(shares), notes
@@ -579,7 +583,7 @@ def split_adjust(shares: dict[int, float]) -> tuple[dict[int, float], list[str]]
             # prior year re-detects the same split on every pass and compounds
             # the factor geometrically.
             ratio = shares[fy] / shares[fys[i - 1]]
-            if ratio > 2.85 or ratio < 0.35:
+            if ratio > 0 and (ratio > 2.85 or ratio < 0.35):
                 # Round to a plausible split ratio. Reverse splits must be
                 # rounded on the reciprocal: round(0.1 * 2) / 2 is zero.
                 if ratio >= 1:
@@ -611,6 +615,7 @@ def load(ticker: str, n_years: int = 10):
 
     shares_out = _instant(facts, ["CommonStockSharesOutstanding", "CommonStockSharesIssued",
                                   "EntityCommonStockSharesOutstanding"], unit="shares")
+    shares_out = {k: v for k, v in shares_out.items() if v and v > 0}
     shares_out, split_notes = split_adjust(shares_out)
     try:
         closes = _monthly_closes(ticker)
@@ -840,9 +845,14 @@ if mode == "Watchlist":
         "one thing here worth running across a whole list at once. Ranked worst first, because "
         "the bottom of this table is where the money quietly leaves."
     )
-    raw = st.text_area("Tickers", placeholder="ADBE, CRM, NOW, GOOGL, META, WDAY",
-                       help="Separated by commas, spaces or new lines. Up to 25.")
-    if st.button("Screen", type="primary"):
+    # A form lets Ctrl+Enter inside the box submit, matching the hint Streamlit
+    # shows under a text area. The button still works for anyone who prefers it.
+    with st.form("screen"):
+        raw = st.text_area("Tickers", placeholder="ADBE, CRM, NOW, GOOGL, META, WDAY",
+                           help="Separated by commas, spaces or new lines. Up to 25. "
+                                "Ctrl+Enter to run.")
+        screen = st.form_submit_button("Screen", type="primary")
+    if screen:
         tickers = [t.strip().upper() for t in raw.replace(",", " ").replace("\n", " ").split()]
         tickers = list(dict.fromkeys([t for t in tickers if t]))[:25]
         if not tickers:
@@ -931,8 +941,14 @@ if submitted:
             with st.spinner(f"Reading {ticker} annual filings…"):
                 yrs, notes, pre = load(ticker, 10)
             st.session_state.update(years=yrs, notes=notes, pre=pre, tk=ticker)
-        except Exception as e:
+        except ValueError as e:
             st.error(f"Could not load {ticker}: {e}")
+        except Exception as e:
+            st.error(
+                f"Could not load {ticker} — {type(e).__name__}: {e}\n\n"
+                "This is a gap in how the filings were read, not something you did. Filers with "
+                "several share classes, recent listings and foreign issuers are the usual "
+                "causes. The Watchlist tab will skip a name like this and carry on.")
 
 years = st.session_state.get("years", [])
 if years and ticker and st.session_state.get("tk") == ticker:
