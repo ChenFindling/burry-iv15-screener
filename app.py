@@ -760,14 +760,16 @@ def load(ticker: str, n_years: int = 10):
         notes.append(
             f"Revenue growth is accelerating — {cagr3:.1%} over three years, {raw_growth:.1%} "
             "in the latest. The seed uses the recent rate; satisfy yourself it is durable.")
-        # A company emerging from near-zero revenue throws an enormous CAGR that
-        # must never be compounded for fifteen years. Burry's rule is that ROIC
-        # caps growth, and hypergrowth gets a separate short Stage 0 rather than
-        # a decade of the launch rate.
+
+    # Applied to EVERY company, not just one branch above. A company emerging
+    # from near-zero revenue throws an enormous rate that must never compound
+    # for fifteen years; ROIC is the real ceiling and hypergrowth belongs in a
+    # short Stage 0 instead.
+    if raw_growth is not None:
         growth = max(-0.10, min(raw_growth, 0.25))
         if abs(raw_growth - growth) > 1e-9:
             notes.append(
-                f"Three-year revenue growth is {raw_growth:.0%}, which is a launch rate, not a "
+                f"Latest revenue growth is {raw_growth:.0%}, which is a launch rate, not a "
                 f"durable one — capped at {growth:.0%} for the seed. Nothing compounds at that "
                 "pace for fifteen years, and return on capital is the real ceiling. If the "
                 "surge is genuinely still ahead, use the hypergrowth years in Model settings "
