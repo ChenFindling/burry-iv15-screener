@@ -45,7 +45,7 @@ import streamlit as st
 
 SEC_HEADERS = {
     # Put your own email here. The SEC blocks generic user agents.
-    "User-Agent": "IV15 Research Tool chenfind@hotmail.com",
+    "User-Agent": "IV15 Research Tool contact@example.com",
     "Accept-Encoding": "gzip, deflate",
 }
 
@@ -217,6 +217,9 @@ class IVParams:
     blend: float = 0.5      # weight on the perpetuity model
     stage0_years: int = 0
     stage0_growth: float = 0.0
+    m2_style: str = "dcf"   # "dcf" = discount the stream, then a year-15 exit
+                            # multiple. "hold" = buy, let it compound, sell in
+                            # year 15 — no interim cash. See note below.
 
 
 def _stream(p: IVParams, n: int) -> list[float]:
@@ -257,9 +260,19 @@ def intrinsic_value(p: IVParams, required_return_pct: float) -> float:
     pv = sum(cf / (1 + r) ** y for y, cf in enumerate(s, 1))
     m1 = pv + s[-1] * (1 + t.terminal_growth_cap) / (r - t.terminal_growth_cap) / (1 + r) ** n
 
+    # Two readings of the Buffett leg, and the published figures do not settle
+    # which is right:
+    #   "dcf"  — a normal DCF that finishes with a market multiple instead of a
+    #            perpetuity. Fits Salesforce, Adobe, Paycom at blends of 0.5-1.
+    #   "hold" — buy the business, let it reinvest, sell in year 15. No interim
+    #            cash reaches you. Only this reading reaches Paylocity's
+    #            published IV15, but it makes the blend a ~3x lever.
     s2 = _stream(p, 15)
-    pv2 = sum(cf / (1 + r) ** y for y, cf in enumerate(s2, 1))
-    m2 = pv2 + s2[-1] * p.exit_multiple / (1 + r) ** 15
+    if p.m2_style == "hold":
+        m2 = s2[-1] * p.exit_multiple / (1 + r) ** 15
+    else:
+        pv2 = sum(cf / (1 + r) ** y for y, cf in enumerate(s2, 1))
+        m2 = pv2 + s2[-1] * p.exit_multiple / (1 + r) ** 15
 
     return (p.blend * m1 + (1 - p.blend) * m2 + p.net_cash) / p.shares
 
@@ -741,6 +754,13 @@ if years and ticker and st.session_state.get("tk") == ticker:
             help=f"Applied to year-15 owners' earnings. Burry never published his; this default "
                  f"is calibrated against Adobe. This tier's perpetuity floor is "
                  f"{AICT[tier_name].perpetuity_equivalent:.1f}x.")
+        m2_style = m1.radio(
+            "Exit-multiple leg", ["dcf", "hold"], horizontal=True,
+            format_func=lambda v: "Cash flows + exit" if v == "dcf" else "Buy and hold to year 15",
+            help="Two readings of Burry's Buffett leg. 'Cash flows + exit' discounts the earnings "
+                 "stream then adds a year-15 multiple, and fits Salesforce, Adobe and Paycom. "
+                 "'Buy and hold' counts only the year-15 sale — the only reading that reaches "
+                 "Paylocity's published figure, but it makes the blend swing results about 3x.")
         blend = m2.slider("Long-horizon weight", 0.0, 1.0, 0.5, 0.05,
                           help="IV15 blends a perpetuity model with an exit-multiple model. "
                                "Moves the answer materially — about \\$10 on CRM.")
@@ -749,7 +769,8 @@ if years and ticker and st.session_state.get("tk") == ticker:
                    f"{t.stage2_multiplier:.2f}x, terminal cap {t.terminal_growth_cap:.0%}, "
                    f"total horizon {t.horizon} years.")
         _l1, _l2 = model_legs(IVParams(OE=OE, shares=shares, tier=tier_name, growth=growth,
-                                       net_cash=net_cash, exit_multiple=exit_m, blend=blend))
+                                       net_cash=net_cash, exit_multiple=exit_m, blend=blend,
+                                       m2_style=m2_style))
         if _l1 == _l1 and _l2 == _l2:
             st.caption(f"Long-horizon leg ${_l1:,.2f} · exit-multiple leg ${_l2:,.2f}. "
                        + ("They agree closely, so the blend barely matters here."
@@ -790,7 +811,8 @@ if years and ticker and st.session_state.get("tk") == ticker:
         st.stop()
 
     par = IVParams(OE=OE, shares=shares, tier=tier_name, growth=growth,
-                   net_cash=net_cash, exit_multiple=exit_m, blend=blend)
+                   net_cash=net_cash, exit_multiple=exit_m, blend=blend,
+                   m2_style=m2_style)
     lad = ladder(par)
     iv15 = lad[15]
 
@@ -901,7 +923,7 @@ if years and ticker and st.session_state.get("tk") == ticker:
             f"owners' earnings    {OE:,.0f}   ({OE/shares:,.2f}/share)\n"
             f"net cash            {net_cash:,.0f}   ({net_cash/shares:,.2f}/share)\n"
             f"tier                {tier_name}   growth {growth:.2%}\n"
-            f"exit multiple       {exit_m:g}x   blend {blend:g}\n"
+            f"exit multiple       {exit_m:g}x   blend {blend:g}   leg {m2_style}\n"
             f"IV15                {iv15:,.2f}   P/IV15 {ratio:.2f}x", language="text")
 
         st.write("**Calibrate against a published IV15**")
