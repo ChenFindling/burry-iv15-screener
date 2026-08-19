@@ -739,6 +739,7 @@ def load(ticker: str, n_years: int = 10):
 
     rev = series.get("REV", {})
     ry = sorted(rev)
+    latest_rev = rev[ry[-1]][2] / 1e6 if ry else 0.0
     growth, raw_growth = 0.08, None
     if len(ry) >= 4 and rev[ry[-4]][2] > 0 and rev[ry[-1]][2] > 0:
         raw_growth = (rev[ry[-1]][2] / rev[ry[-4]][2]) ** (1 / 3) - 1
@@ -758,7 +759,7 @@ def load(ticker: str, n_years: int = 10):
     _kept_oe = sorted(y.OE for y in years[-5:] if not y.excluded)
     _med = _kept_oe[len(_kept_oe) // 2] if _kept_oe else 0.0
     return years, notes, {"net_cash": net_cash, "cash": cash_total, "debt": debt_total,
-                          "median_OE": _med,
+                          "median_OE": _med, "revenue": latest_rev,
                           "leases": lease_total,
                           "shares": diluted, "growth": growth, "sic": sic,
                           "sic_desc": sic_desc, "financial": is_financial(sic)}
@@ -1013,6 +1014,13 @@ tier_name = st.selectbox("Moat tier", list(AICT), index=2,
                          help="Sets stage lengths, how far growth fades in stage 2, the terminal "
                               "cap and the exit multiple. It does NOT set your stage 1 growth "
                               "rate — that is company-specific and yours to judge.")
+_t = AICT[tier_name]
+st.caption(
+    f"**{_t.horizon}-year horizon · {_t.default_exit_multiple:g}× exit · "
+    f"{_t.terminal_growth_cap:.0%} terminal.** Tier is the single biggest lever here — Stone "
+    f"instead of Chapel roughly halves IV15. Set it deliberately for every company; leaving it "
+    "on the default will quietly overvalue anything genuinely threatened."
+)
 
 if submitted:
     if not ticker:
@@ -1129,6 +1137,18 @@ if years and ticker and st.session_state.get("tk") == ticker:
                        + ("They agree closely, so the blend barely matters here."
                           if abs(_l1 - _l2) / max(_l1, 1) < 0.1 else
                           "They diverge, so the blend is doing real work — worth a look."))
+
+    _rev = prefill.get("revenue", 0.0)
+    if _rev > 0 and OE > 0:
+        _margin = OE / _rev
+        if _margin < 0.08 and growth > 0.12:
+            alerts.append(("warning",
+                f"Owners' earnings are only {_margin:.1%} of {d(_rev,0)}M revenue while growth is "
+                f"seeded at {growth:.1%}. Compounding a thin margin at the revenue rate is the "
+                "wrong shape for this company — the story is margin recovery, not earnings "
+                "compounding. Burry's rule is that profit inflection points require estimating "
+                "the margin path, which is what the hypergrowth years in Model settings are for. "
+                "ServiceNow and monday.com both need this treatment."))
 
     if not dE_ok and median_OE <= 0:
         st.error(
@@ -1252,6 +1272,15 @@ if years and ticker and st.session_state.get("tk") == ticker:
     q3.metric("Value kept after 10y", f"{pooled.retention(10):.1%}" if 0 < pooled.dE <= 1.25 else "—",
               "of reported growth")
 
+    if pooled.sum_OE < 0 and price > 0:
+        st.info(
+            "Owners' earnings are negative over this window. Burry still publishes IV15 values for "
+            "such companies — Zscaler, Palo Alto and CrowdStrike all have negative owners' earnings "
+            "in his write-ups yet carry IV15 targets — because he values a projected recovery to "
+            "profitability rather than today's losses. To follow that here, enter the owners' "
+            "earnings you think the business reaches, and use the hypergrowth years to model the "
+            "path. This tool cannot infer that path for you.")
+
     if pooled.dE > 1.25:
         st.warning(
             f"**ΔE of {pooled.dE:.0%} is not a real result.** Keeping more than every reported "
@@ -1309,7 +1338,7 @@ if years and ticker and st.session_state.get("tk") == ticker:
                 "Owners' earnings": "{:,.0f}", "ΔE": "{:.1%}"}, na_rep="—"),
             width='stretch', hide_index=True)
 
-        st.write("**Assumptions used**")
+        st.write("**Assumptions used** — paste this if something looks wrong")
         st.code(
             f"{tk}   price {price:,.2f}   shares {shares:,.1f}M   "
             f"mkt cap ${shares*price/1000:,.2f}B\n"
