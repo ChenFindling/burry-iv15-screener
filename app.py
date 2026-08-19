@@ -728,8 +728,9 @@ def load(ticker: str, n_years: int = 10):
     lease_total = g(BALANCE["lease"])
     net_cash = cash_total - debt_total
     if debt_total == 0 and lease_total > 0:
-        notes.append(f"No funded debt found, which for many retailers and restaurant chains is "
-                     f"simply true. It does carry {lease_total:,.0f}M of long-term operating "
+        notes.append(f"No funded debt found, which for many companies is simply true — plenty "
+                     f"fund themselves entirely from operations. It does carry "
+                     f"{lease_total:,.0f}M of long-term operating "
                      "lease obligations — real commitments, but Burry's framework handles leases "
                      "inside the capital base rather than as borrowings, so they are not "
                      "subtracted here.")
@@ -1108,7 +1109,8 @@ if years and ticker and st.session_state.get("tk") == ticker:
 
     use_recent = st.radio(
         "Apply ΔE from", ["Last 3 years", "Full period"], horizontal=True,
-        captions=[f"{recent.dE:.1%}", f"{pooled.dE:.1%}"],
+        captions=[f"{recent.dE:.1%}" if recent.dE_defined else "n/a — losses",
+                  f"{pooled.dE:.1%}" if pooled.dE_defined else "n/a — losses"],
         help="ΔE is the share of reported profit that actually reaches shareholders. The long "
              "window is the diagnostic; where capital policy has changed, the recent one is "
              "what will apply going forward.") == "Last 3 years"
@@ -1212,26 +1214,42 @@ if years and ticker and st.session_state.get("tk") == ticker:
                 "ServiceNow and monday.com both need this treatment."))
 
     if not dE_ok and median_OE <= 0:
-        st.error(
-            f"**Set owners' earnings yourself.** ΔE of {use_dE:.1%} cannot be projected, and "
-            "every recent year is negative too, so the field below is seeded with forward net "
-            f"income of {d(fwd_N,0)}M as a ceiling — it is certainly too high. Burry does this "
-            "by hand: ServiceNow gets about 620M against reported profit near 1,750M, adjusted "
-            "upward from a negative ΔE for its dilution-neutral pledge and its sub-10%-of-revenue "
-            "SBC target.")
+        if not (pooled.dE_defined and recent.dE_defined):
+            st.error(
+                f"**Set owners' earnings yourself.** Cumulative net income is negative "
+                f"({d(pooled.sum_N,0)}M), so ΔE is undefined — the percentages above are not "
+                f"usable and are shown only for completeness. The field below is seeded with "
+                f"forward net income of {d(fwd_N,0)}M as a ceiling; it is almost certainly too "
+                "high, since this business has not yet earned that in a normal year. Enter what "
+                "you think it earns once profitable. Burry publishes IV15 for loss-makers "
+                "— Zscaler, Palo Alto and CrowdStrike all have negative owners' earnings in his "
+                "write-ups — by valuing the recovery, not today's losses.")
+        else:
+            st.error(
+                f"**Set owners' earnings yourself.** ΔE of {use_dE:.1%} cannot be projected, and "
+                f"every recent year is negative too, so the field below is seeded with forward "
+                f"net income of {d(fwd_N,0)}M as a ceiling — it is certainly too high. Burry "
+                "does this by hand: ServiceNow gets about 620M against reported profit near "
+                "1,750M, adjusted upward from a negative ΔE for its dilution-neutral pledge "
+                "and its sub-10%-of-revenue SBC target.")
 
     if not dE_ok:
-        if use_dE < 0:
-            _why = ("stock compensation has swamped earnings over this window")
-        elif use_dE > 1.25:
-            _why = ("the ratio is above 100%, which means either the denominator was negative "
-                    "or share issuance is not being captured — either way it cannot be projected")
+        if not (pooled.dE_defined and recent.dE_defined):
+            alerts.append(("error",
+                "ΔE is undefined because cumulative net income is negative. A ratio against a "
+                "negative denominator flips sign, so the percentages shown are not usable. Set "
+                "owners' earnings by hand from what the business earns once profitable."))
+        elif use_dE < 0:
+            alerts.append(("error",
+                f"ΔE of {use_dE:.1%} cannot be projected forward — stock compensation has "
+                "swamped earnings over this window. Set owners' earnings by hand. Burry does "
+                "exactly this for DocuSign: ΔE deeply negative, yet about 195M of forward "
+                "owners' earnings on judgement, worked down from free cash flow."))
         else:
-            _why = "the ratio is zero or undefined"
-        alerts.append(("error",
-            f"ΔE of {use_dE:.1%} cannot be projected forward — {_why}. Set owners' earnings by "
-            "hand. Burry does exactly this for DocuSign: ΔE deeply negative, yet about 195M of "
-            "forward owners' earnings on judgement, worked down from free cash flow."))
+            alerts.append(("error",
+                f"ΔE of {use_dE:.1%} is above 100%, which means share issuance is not being "
+                "fully captured — a company cannot keep more than every reported dollar. It "
+                "cannot be projected forward. Set owners' earnings by hand."))
     elif median_OE > 0 and derived > 2 * median_OE:
         alerts.append(("warning",
             f"Derived owners' earnings of {d(derived,0)}M are {derived/median_OE:.1f}x the "
