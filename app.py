@@ -287,6 +287,26 @@ def expected_return(price: float, p: IVParams) -> float:
     return (lo + hi) / 2
 
 
+def solve_growth(target_iv15: float, p: IVParams,
+                 lo: float = -0.30, hi: float = 1.00) -> float | None:
+    """Growth rate reproducing a given IV15, by bisection.
+
+    Intrinsic value rises monotonically with growth, so bisection is exact
+    enough and avoids a scipy dependency for one root-find.
+    """
+    f = lambda g: intrinsic_value(IVParams(**{**p.__dict__, "growth": g}), 15) - target_iv15
+    flo, fhi = f(lo), f(hi)
+    if flo != flo or fhi != fhi or flo * fhi > 0:
+        return None
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if f(lo) * f(mid) <= 0:
+            hi = mid
+        else:
+            lo = mid
+    return (lo + hi) / 2
+
+
 def valuation_points(ratio: float) -> int:
     if ratio < 0:
         return -2
@@ -446,6 +466,48 @@ def current_price(ticker: str) -> float | None:
         return None
 
 
+def split_adjust(shares: dict[int, float]) -> tuple[dict[int, float], list[str]]:
+    """Restate historical share counts onto the current basis.
+
+    Gate 3 of the published QA protocol: year-on-year share counts must stay
+    within [0.35, 2.85]. Outside that band is a stock split, not real dilution.
+
+    This matters enormously. XBRL reports shares as-filed, so pre-split years
+    carry the old basis, while market prices are already split-adjusted. Mixing
+    the two makes dS jump by the whole split in one year, and since
+    V = T + P x dS, the SBC cost explodes. ServiceNow's 5-for-1 turned a
+    pooled dE of about -79% into -2391%.
+    """
+    fys, notes = sorted(shares), []
+    if len(fys) < 2:
+        return dict(shares), notes
+    adjusted, factor = {}, 1.0
+    for i in range(len(fys) - 1, -1, -1):
+        fy = fys[i]
+        adjusted[fy] = shares[fy] * factor
+        if i > 0 and shares[fys[i - 1]] > 0:
+            # Raw-to-raw. Comparing the ADJUSTED current year against the raw
+            # prior year re-detects the same split on every pass and compounds
+            # the factor geometrically.
+            ratio = shares[fy] / shares[fys[i - 1]]
+            if ratio > 2.85 or ratio < 0.35:
+                # Round to a plausible split ratio. Reverse splits must be
+                # rounded on the reciprocal: round(0.1 * 2) / 2 is zero.
+                if ratio >= 1:
+                    clean = round(ratio * 2) / 2
+                    label = f"{clean:g}:1"
+                else:
+                    inv = round((1 / ratio) * 2) / 2
+                    clean = 1 / inv if inv > 0 else 0.0
+                    label = f"1:{inv:g}"
+                if clean > 0:
+                    factor *= clean
+                    notes.append(f"Stock split detected in FY{fy} (about {label}). Earlier "
+                                 "share counts restated onto the current basis — without this "
+                                 "the SBC cost would be wildly overstated.")
+    return adjusted, notes
+
+
 def load(ticker: str, n_years: int = 10):
     cmap = _ticker_map()
     if ticker not in cmap:
@@ -459,13 +521,14 @@ def load(ticker: str, n_years: int = 10):
 
     shares_out = _instant(facts, ["CommonStockSharesOutstanding", "CommonStockSharesIssued",
                                   "EntityCommonStockSharesOutstanding"], unit="shares")
+    shares_out, split_notes = split_adjust(shares_out)
     try:
         closes = _monthly_closes(ticker)
     except Exception:
         closes = {}
 
     fys = sorted(series["N"])[-n_years:]
-    notes: list[str] = []
+    notes: list[str] = list(split_notes)
     years: list[Year] = []
 
     for fy in fys:
@@ -801,13 +864,10 @@ if years and ticker and st.session_state.get("tk") == ticker:
         target = st.number_input("Published IV15", value=0.0, step=0.01,
                                  label_visibility="collapsed")
         if target > 0:
-            try:
-                from scipy.optimize import brentq
-                solved = brentq(lambda g: intrinsic_value(
-                    IVParams(OE=OE, shares=shares, tier=tier_name, growth=g, net_cash=net_cash,
-                             exit_multiple=exit_m, blend=blend), 15) - target, -0.30, 1.00)
-                st.success(f"Growth of **{solved:.2%}** reproduces {d(target)} at your current "
-                           f"exit multiple and blend.")
-            except Exception:
+            solved = solve_growth(target, par)
+            if solved is None:
                 st.error("No growth rate between -30% and +100% reaches that. Owners' earnings, "
                          "share count, exit multiple or blend is likely off.")
+            else:
+                st.success(f"Growth of **{solved:.2%}** reproduces {d(target)} at your current "
+                           f"exit multiple and blend.")
