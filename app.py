@@ -648,17 +648,29 @@ def load(ticker: str, n_years: int = 10):
     # what drives absurd negative dE for recently listed companies. The tell is
     # the first year a market price exists carrying a share jump no payroll
     # could produce.
+    # Compensation dilutes 1-3% of the share count a year. Alphabet's worst year
+    # is 1.4%, Meta's 1.6%. A double-digit jump is a capital event — a listing,
+    # an all-stock acquisition or a secondary — and pricing it at market charges
+    # the whole deal to employees. Broadcom's VMware year alone put roughly $86B
+    # of phantom SBC cost into a 10-year pool that should total $51.6B.
     priced = [i for i, y in enumerate(years) if y.price > 0]
-    if priced:
-        i = priced[0]
-        base = shares_out.get(fys[i] - 1, 0.0) / 1e6 or abs(years[i].dS)
-        if base > 0 and years[i].dS / base > 0.25:
-            years[i].excluded = "listing year"
+    for i in priced:
+        base = shares_out.get(fys[i] - 1, 0.0) / 1e6
+        if base <= 0:
+            continue
+        jump = years[i].dS / base
+        first_priced = (i == priced[0])
+        if jump > (0.25 if first_priced else 0.15):
+            kind = "listing year" if first_priced else "share-funded acquisition"
+            years[i].excluded = kind
             notes.append(
-                f"FY{years[i].fy} excluded — the share count jumped "
-                f"{years[i].dS / base:.0%} in the first year with a market price, which is a "
-                "listing rather than compensation. At IPO, preferred converts to common and new "
-                "stock is sold; pricing that as pay would make ΔE meaninglessly negative.")
+                f"FY{years[i].fy} excluded — the share count rose {jump:.0%} in one year, which "
+                "no payroll produces. That is a "
+                + ("listing: preferred converts to common and new stock is sold."
+                   if first_priced else
+                   "capital event, most often an all-stock acquisition.")
+                + " Counting it as compensation would swamp every other year in the pool. The "
+                  "pooled figures now cover fewer years, so read them with that in mind.")
 
     if non_sbc_total:
         notes.append(f"Excluded {non_sbc_total:,.1f}M shares issued for acquisitions, offerings "
