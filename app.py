@@ -792,9 +792,11 @@ def self_test() -> list[tuple[str, bool, str]]:
 
     crm = IVParams(OE=7300, shares=1073.3, tier="Chapel", growth=0.069,
                    exit_multiple=21.8, blend=1.0)
-    out.append(("Salesforce IV15 ≈ $69.81", abs(intrinsic_value(crm, 15) - 69.81) < 1.0,
+    out.append(("Salesforce IV15, his inputs → $69.81",
+                abs(intrinsic_value(crm, 15) - 69.81) < 1.0,
                 f"${intrinsic_value(crm,15):.2f}"))
-    out.append(("Salesforce IVB ≈ 8.6%", abs(expected_return(165.84, crm) - 0.086) < 0.005,
+    out.append(("Salesforce IVB, his inputs → 8.6%",
+                abs(expected_return(165.84, crm) - 0.086) < 0.005,
                 f"{expected_return(165.84, crm):.1%}"))
     return out
 
@@ -827,13 +829,7 @@ st.title("🎯 Tragic Algebra Analyzer")
 st.caption("True owners' earnings after stock compensation, then the price ladder that follows")
 
 with st.sidebar:
-    st.subheader("Self-test")
-    st.caption("Checks the engine against Burry's published figures.")
-    if st.button("Run"):
-        for name, ok, got in self_test():
-            st.write(("✅ " if ok else "❌ ") + f"{name} — {got}")
-    st.divider()
-    with st.expander("What the numbers mean"):
+    with st.expander("What the numbers mean", expanded=False):
         st.markdown(
             "**ΔE** — the share of each reported dollar of profit that actually reaches "
             "shareholders once the true cost of stock compensation is charged. Below about "
@@ -848,6 +844,22 @@ with st.sidebar:
             "**Moat tier** — sets how long growth lasts and how fast it fades, not the "
             "starting rate. Fortress holds growth 8 years; Wood gets 2."
         )
+
+    with st.expander("Verify the engine"):
+        st.caption(
+            "These run the formulas on **Burry's own published inputs** and check the output "
+            "against his published results. They confirm the maths is right.\n\n"
+            "They will not match what you get by entering a ticker above. A live run uses "
+            "today's filings, today's share count, growth seeded from revenue, and the tier "
+            "defaults — different inputs, so a different answer. Salesforce comes out near "
+            "$69 either way, but the two are answering different questions."
+        )
+        if st.button("Run checks"):
+            for name, ok, got in self_test():
+                st.write(("✅ " if ok else "❌ ") + f"{name} — {got}")
+            st.caption("Tolerances: dollar figures within $1, ratios within half a point. "
+                       "Burry rounds published prices and share counts, so exact equality "
+                       "is not achievable and would be a suspicious thing to claim.")
     st.divider()
     st.caption(
         "Research aid, not financial advice. Outputs depend on estimates you supply — change "
