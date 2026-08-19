@@ -1,5 +1,5 @@
 """
-Burry IV15 Screener
+Cassandra IV15 Analyzer
 ===================
 Owners' earnings adjusted for the true cost of stock compensation, then the
 intrinsic value ladder that follows from them.
@@ -47,7 +47,7 @@ import streamlit as st
 
 SEC_HEADERS = {
     # Put your own email here. The SEC blocks generic user agents.
-    "User-Agent": "IV15 Research Tool contact@example.com",
+    "User-Agent": "IV15 Research Tool chenfind@hotmail.com",
     "Accept-Encoding": "gzip, deflate",
 }
 
@@ -808,7 +808,14 @@ def self_test() -> list[tuple[str, bool, str]]:
 # escaped as \$ or the text between two of them silently becomes an equation.
 # st.metric, st.code and st.dataframe are unaffected.
 
-st.set_page_config(page_title="Burry IV15 Screener", layout="centered")
+# page_title is the meta title: browser tab AND search results. It carries the
+# terms people actually search — "tragic algebra", "owners earnings", "stock
+# based compensation" — not just the product name, which nobody searches for.
+st.set_page_config(
+    page_title="Tragic Algebra & IV15 Analyzer — Michael Burry Owners' Earnings Calculator",
+    page_icon="🎯",
+    layout="centered",
+)
 
 
 def d(x, dp=2):
@@ -816,7 +823,7 @@ def d(x, dp=2):
     return f"\\${x:,.{dp}f}"
 
 
-st.title("🎯 Burry IV15 Value Screener")
+st.title("🎯 Cassandra IV15 Analyzer")
 st.caption("True owners' earnings after stock compensation, then the price ladder that follows")
 
 with st.sidebar:
