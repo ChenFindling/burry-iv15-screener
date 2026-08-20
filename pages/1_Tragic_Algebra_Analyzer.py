@@ -1448,8 +1448,8 @@ with _r2:
             "against his published results. They confirm the maths is right.\n\n"
             "They will not match what you get by entering a ticker above. A live run uses "
             "today's filings, today's share count, growth seeded from revenue, and the tier "
-            "defaults — different inputs, so a different answer. Salesforce comes out near "
-            "$69 either way, but the two are answering different questions."
+            "defaults — different inputs, so a different answer. Both land in a similar range; "
+            "they are simply answering different questions."
         )
         if st.button("Run checks"):
             for name, ok, got in self_test():
@@ -1457,12 +1457,6 @@ with _r2:
             st.caption("Tolerances: dollar figures within $1, ratios within half a point. "
                        "Burry rounds published prices and share counts, so exact equality "
                        "is not achievable and would be a suspicious thing to claim.")
-    st.divider()
-    st.caption(
-        "Research aid, not financial advice. Outputs depend on estimates you supply — change "
-        "the growth rate and the answer changes a lot. Method follows Michael Burry's published "
-        "writing; this tool is not affiliated with or endorsed by him."
-    )
 
 st.caption(
     "Research aid, not financial advice. Outputs depend on estimates you supply. Method "
