@@ -9,7 +9,7 @@ Implements the full formula from *AP SBC: The Tragic Algebra Recurrence*, includ
 share-issuance term that pure-dilution companies need, and reproduces Burry's published
 figures exactly (see [Validation](#-validation)).
 
-🔗 **Live app:** [burry-iv15-screener.streamlit.app](https://burry-iv15-screener.streamlit.app/)
+🔗 **Live app:** [https://tragic-algebra-analyzer.streamlit.app/](https://tragic-algebra-analyzer.streamlit.app/)
 
 ---
 
