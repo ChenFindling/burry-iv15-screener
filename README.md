@@ -9,7 +9,7 @@ Implements the full formula from *AP SBC: The Tragic Algebra Recurrence*, includ
 share-issuance term that pure-dilution companies need, and reproduces Burry's published
 figures exactly (see [Validation](#-validation)).
 
-🔗 **Live app:** [https://tragic-algebra-analyzer.streamlit.app/](https://tragic-algebra-analyzer.streamlit.app/)
+🔗 **Live app:** [https://tragic-algebra-analyzer.streamlit.app/Tragic_Algebra_Analyzer](https://tragic-algebra-analyzer.streamlit.app/Tragic_Algebra_Analyzer)
 
 ---
 
@@ -161,6 +161,11 @@ the judgement.
   not contain.
 * **Complex structures.** Up-C partnerships with large non-controlling interests report only
   the parent's slice of income against a full share count.
+* **Bundled line items.** Burry reads the 10-K footnotes by hand because filers combine line
+  items — the buyback line often carries RSU withholding tax. Because Ω = C + V, that
+  particular error cancels here (V is overstated by exactly what C is understated by), and
+  this tool never derives price from T/W, so the channel that corrupts his figures does not
+  apply. Filers reporting a single net proceeds line are still a genuine gap.
 * **M&A share issuance.** Deducted where XBRL tags it, and whole years are excluded when the
   share count jumps more than 15%. Smaller untagged issuance still inflates ΔS.
 * **Owner earnings normalisation.** Where ΔE is negative or absurd, the figure must be set by
