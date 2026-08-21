@@ -895,7 +895,16 @@ def d(x, dp=2):
     return f"\\${x:,.{dp}f}"
 
 
-# Page config lives in Home.py — only the entrypoint may set it.
+# Each page needs its own config. Streamlit only runs the entrypoint when you
+# land on it, so arriving here by deep link — which is what shared links do —
+# would otherwise leave the default favicon and title. Must be the first
+# Streamlit command executed in this file.
+st.set_page_config(
+    page_title="Tragic Algebra & IV15 Analyzer — Michael Burry Owners' Earnings Calculator",
+    page_icon="🎯",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
 st.title("🎯 Tragic Algebra Analyzer")
 st.caption("True owners' earnings after stock compensation, then the price ladder that follows")
 
