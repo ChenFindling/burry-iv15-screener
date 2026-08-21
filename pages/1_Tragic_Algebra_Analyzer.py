@@ -514,6 +514,26 @@ def _annual(facts: dict, us: list[str], ifrs: list[str]) -> dict[int, tuple[str,
     return {}
 
 
+def reporting_currency(facts: dict, concepts: list[str]) -> str | None:
+    """Currency this filer actually reports in.
+
+    Everything downstream assumes USD. A foreign private issuer filing a 20-F
+    in EUR has perfectly good data under a EUR unit key that this reader never
+    looks at, which used to surface as 'no net income found' and blame the
+    taxonomy. Naming the currency turns a confusing dead end into a clear
+    limitation.
+    """
+    for taxonomy in ("us-gaap", "ifrs-full"):
+        tax = facts.get("facts", {}).get(taxonomy, {})
+        for concept in concepts:
+            if concept not in tax:
+                continue
+            units = [u for u in tax[concept].get("units", {}) if u != "shares"]
+            if units:
+                return "USD" if "USD" in units else units[0]
+    return None
+
+
 def _instant(facts: dict, concepts: list[str], unit: str = "USD") -> dict[int, float]:
     """Latest balance-sheet value per fiscal year.
 
@@ -639,8 +659,17 @@ def load(ticker: str, n_years: int = 10):
 
     series = {k: _annual(facts, us, ifrs) for k, (us, ifrs) in CONCEPTS.items()}
     if not series["N"]:
-        raise ValueError("No annual net income found — this filer uses a taxonomy "
-                         "the app does not map. Try the manual tab.")
+        ccy = reporting_currency(facts, CONCEPTS["N"][0] + CONCEPTS["N"][1])
+        if ccy and ccy != "USD":
+            raise ValueError(
+                f"{ticker} reports in {ccy}, not US dollars. Every figure here assumes one "
+                "currency throughout, and mixing a euro income statement with a dollar share "
+                "price would produce numbers that look fine and are wrong. Foreign private "
+                "issuers filing in their home currency are not supported.")
+        raise ValueError(
+            f"No annual net income found for {ticker}. The filer uses tags this reader does "
+            "not recognise, which happens with unusual structures and some foreign issuers. "
+            "Nothing can be computed without it.")
 
     shares_out = _instant(facts, ["CommonStockSharesOutstanding", "CommonStockSharesIssued",
                                   "EntityCommonStockSharesOutstanding"], unit="shares")
