@@ -445,6 +445,11 @@ class Capital:
     op_cash_pct: float = 0.02
     other_capital: float = 0.0     # judgement, seeded at zero
     equity_found: bool = False
+    # Two switches, both off by default, which together are the difference
+    # between this number and the one on a data provider's website. Neither
+    # is a correction: they are different questions about the same filings.
+    include_leases: bool = False   # capitalised office and store networks
+    cash_in_base: bool = False     # leave cash in, as most providers do
 
     @property
     def op_cash_need(self) -> float:
@@ -457,11 +462,20 @@ class Capital:
 
     @property
     def deployable_cash(self) -> float:
+        if self.cash_in_base:
+            return 0.0
         return max(0.0, self.cash - self.op_cash_need)
 
     @property
     def total_capital(self) -> float:
-        return self.equity + self.debt + self.finance_leases
+        base = self.equity + self.debt + self.finance_leases
+        # A leased office network is capital at work whatever the accounting
+        # calls it. Burry's formula removes operating leases from a
+        # total-capital figure that already contained them; this base never
+        # did, so the switch adds them rather than subtracting. For a filer
+        # with thousands of leased locations this is the difference between
+        # a return on almost nothing and a return on the actual footprint.
+        return base + (self.operating_leases if self.include_leases else 0.0)
 
     @property
     def invested(self) -> float:
@@ -598,7 +612,10 @@ CONCEPTS = {
            ["ProfitLoss", "ProfitLossAttributableToOwnersOfParent"]),
     "G":  (["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"],
            ["ShareBasedPaymentsExpense"]),
-    "T":  (["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity"],
+    "T":  (["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity",
+            "PaymentsForRepurchaseOfCommonStockAndRestrictedStockUnits",
+            "TreasuryStockValueAcquiredCostMethod",
+            "PaymentsForRepurchaseOfRedeemableConvertiblePreferredStock"],
            ["PaymentsToAcquireOrRedeemEntitysShares"]),
     "Cw": (["PaymentsRelatedToTaxWithholdingForShareBasedCompensation"], []),
     "Ce": (["ProceedsFromIssuanceOfSharesUnderIncentiveAndShareBasedCompensationPlans",
@@ -823,7 +840,8 @@ def load(ticker: str, n_years: int = 10):
 
 
 def build_roic(years: list[Year], pre: dict, op_cash_pct: float,
-               other_expense: float, other_capital: float) -> list[RoicYear]:
+               other_expense: float, other_capital: float,
+               include_leases: bool = False, cash_in_base: bool = False) -> list[RoicYear]:
     """Assemble Burry's ROIC per year.
 
     The two judgement terms are applied to the latest year only. Spreading a
@@ -837,6 +855,7 @@ def build_roic(years: list[Year], pre: dict, op_cash_pct: float,
         cap = pre["caps"].get(y.fy, Capital(fy=y.fy))
         cap.op_cash_pct = op_cash_pct
         cap.other_capital = other_capital if y.fy == last else 0.0
+        cap.include_leases, cap.cash_in_base = include_leases, cash_in_base
         out.append(RoicYear(
             fy=y.fy, OE=y.OE,
             interest_income=pre["interest"].get(y.fy, 0.0),
@@ -896,26 +915,69 @@ def assess(required: float | None, fundable: float | None,
     return Verdict("The arithmetic is open", "success", "both")
 
 
-def pooled_payout(years: list[Year], dividends: dict[int, float],
-                  n: int = 5) -> tuple[float | None, float]:
-    """(share of owners' earnings returned to shareholders, average buyback $M).
+@dataclass
+class Payout:
+    """What a company hands back, kept in pieces.
 
-    Pooled over several years rather than taken from the latest, for the same
-    reason ΔE is pooled in tool 1: a single year's buyback is a decision, not a
-    policy, and one big repurchase would otherwise read as permanent.
+    A single ratio was the wrong output here. H&R Block came back as "retains
+    70%" — which was dividends alone, with several hundred million a year of
+    buybacks missing, because one XBRL tag did not match. A ratio cannot show
+    you that; its components can.
+    """
+    dividends: float = 0.0        # $M a year, averaged
+    buybacks: float = 0.0         # as filed
+    implied: float = 0.0          # from shares retired x price: a floor
+    oe: float = 0.0
+    used_implied: bool = False
 
-    Buybacks appear on both sides of the ceiling calculation and that is not
-    double counting. They leave the numerator because a dollar returned is a
-    dollar not reinvested; they come back as a share-count effect because a
+    @property
+    def returned(self) -> float:
+        return self.dividends + (self.implied if self.used_implied else self.buybacks)
+
+    @property
+    def ratio(self) -> float | None:
+        return self.returned / self.oe if self.oe > 0 else None
+
+    @property
+    def warning(self) -> str:
+        if not self.used_implied:
+            return ""
+        return (f"No repurchase line was found in the filings, but the share count fell by about "
+                f"\\${self.implied:,.0f}M a year at market prices. The payout below uses that "
+                "implied figure instead of zero — it is a floor, since shares issued to "
+                "employees offset some of what was bought.")
+
+
+def pooled_payout(years: list[Year], dividends: dict[int, float], n: int = 5) -> Payout:
+    """Cash returned to shareholders, pooled over several years.
+
+    Pooled rather than taken from the latest year for the same reason ΔE is
+    pooled in tool 1: one big repurchase is a decision, not a policy.
+
+    Buybacks appear on both sides of the ceiling and that is not double
+    counting. They leave the numerator because a dollar returned is a dollar
+    not reinvested; they come back as a share-count effect because a
     hundredfold on fewer shares is still a hundredfold to whoever stayed.
     """
     clean = [y for y in years if not y.excluded][-n:]
     if not clean:
-        return None, 0.0
-    total_oe = sum(y.OE for y in clean)
-    buybacks = sum(y.T for y in clean)
-    returned = buybacks + sum(dividends.get(y.fy, 0.0) for y in clean)
-    return (returned / total_oe if total_oe > 0 else None), buybacks / len(clean)
+        return Payout()
+    k = len(clean)
+    p = Payout(
+        dividends=sum(dividends.get(y.fy, 0.0) for y in clean) / k,
+        buybacks=sum(y.T for y in clean) / k,
+        # Shares retired, valued at that year's average price. dS is already net
+        # of issuance, so this understates gross repurchases — a floor, which is
+        # the right direction for a fallback.
+        implied=sum(max(0.0, -y.dS) * y.price for y in clean) / k,
+        oe=sum(y.OE for y in clean) / k,
+    )
+    # Only step in when the filed figure is not merely lower but absent, and the
+    # share count says real money was spent. A company that genuinely does not
+    # repurchase has an implied figure of zero and is untouched.
+    if p.implied > 0 and p.buybacks < 0.25 * p.implied:
+        p.used_implied = True
+    return p
 
 
 def roic_caveat(r: RoicYear, fye_month: int) -> str:
@@ -1001,6 +1063,34 @@ def self_test() -> list[tuple[str, bool, str]]:
                                equity_found=True))
     out.append(("Negative capital base refuses rather than flipping sign",
                 neg.reason != "" and neg.roic is None, neg.reason or "printed a number"))
+
+    # 4b. The payout cross-check. HRB shaped: dividends tagged, buybacks not,
+    #     share count visibly shrinking.
+    hrb = [Year(fy=f, N=600, G=70, T=0.0, dS=-8.0, price=55.0) for f in range(2022, 2027)]
+    pz = pooled_payout(hrb, {f: 190.0 for f in range(2022, 2027)}, 5)
+    out.append(("Missing buyback line caught by the share count",
+                pz.used_implied and abs(pz.implied - 440) < 1,
+                f"implied ${pz.implied:,.0f}M/yr vs ${pz.buybacks:,.0f}M filed"))
+    out.append(("...and payout rises from 28% to 94%",
+                pz.ratio is not None and abs(pz.ratio - 0.9403) < 0.005,
+                f"{pz.ratio:.1%}, filed-only would be {190/670:.0%}"))
+    real = pooled_payout([Year(fy=f, N=600, G=70, T=400.0, dS=-8.0, price=55.0)
+                          for f in range(2022, 2027)], {}, 5)
+    out.append(("A filed buyback line is left alone",
+                not real.used_implied, f"used filed ${real.buybacks:,.0f}M"))
+
+    # 4c. The capital-base switches, on the H&R Block shape: they should carry
+    #     a triple-digit Burry ROIC down toward what a data provider publishes.
+    base = Capital(fy=2026, equity=100, debt=1500, cash=900, operating_leases=250,
+                   revenue=3600, equity_found=True)
+    r_burry = RoicYear(fy=2026, OE=770, interest_income=0, lease_payments=0,
+                       other_expense=0, cap=base)
+    conv = Capital(**{**base.__dict__, "include_leases": True, "cash_in_base": True})
+    r_conv = RoicYear(fy=2026, OE=770, interest_income=0, lease_payments=0,
+                      other_expense=0, cap=conv)
+    out.append(("Switches reconcile a Burry ROIC toward a published one",
+                r_burry.roic > 0.90 and r_conv.roic < 0.50,
+                f"{r_burry.roic:.0%} -> {r_conv.roic:.0%}"))
 
     # 5. The verdict itself.
     v = assess(0.272, 0.075, 0.04, 5_000)
@@ -1171,15 +1261,34 @@ if years and ticker and st.session_state.get("hb_tk") == ticker:
         op_cash_pct = j3.number_input("Operating cash (% of revenue)", value=2.0, step=0.5,
                                       min_value=0.0, max_value=25.0) / 100.0
 
+        st.caption(
+            "**Reconciling with the websites.** A ROIC here will usually read higher than "
+            "GuruFocus, Stockanalysis or Morningstar, and two choices account for most of the "
+            "gap. Burry takes deployable cash out of the capital base; almost no provider does. "
+            "And this base is equity plus borrowings, which leaves a leased store or office "
+            "network out of capital altogether. Turn both on to see roughly the number they "
+            "publish, then decide which question you wanted answered.")
+        k1, k2 = st.columns(2)
+        include_leases = k1.checkbox(
+            "Count long-term operating leases as capital", value=False,
+            help="For a company with thousands of leased locations, the lease obligation is the "
+                 "asset base. Leaving it out flatters the return enormously.")
+        cash_in_base = k2.checkbox(
+            "Leave cash in the capital base", value=False,
+            help="What most data providers do. Turn it on to compare like with like; turn it off "
+                 "to follow Burry.")
+
     # ── the three rates ──────────────────────────────────────────────
-    rows = build_roic(years, pre, op_cash_pct, other_expense, other_capital)
+    rows = build_roic(years, pre, op_cash_pct, other_expense, other_capital,
+                      include_leases, cash_in_base)
     rows[-1].OE = OE                      # latest year follows the box above
     rows[-1].other_expense = other_expense
     latest_r = rows[-1]
     roic_med = None if financial else median_roic(rows, 5)
 
-    payout, avg_buyback = pooled_payout(years, pre["dividends"], 5)
-    buyback_yield = avg_buyback / mcap if mcap > 0 else 0.0
+    pay = pooled_payout(years, pre["dividends"], 5)
+    payout = pay.ratio
+    buyback_yield = (pay.implied if pay.used_implied else pay.buybacks) / mcap if mcap > 0 else 0.0
     fundable = (per_share_ceiling(roic_med, payout, buyback_yield)
                 if roic_med is not None and payout is not None else None)
 
@@ -1210,6 +1319,20 @@ if years and ticker and st.session_state.get("hb_tk") == ticker:
               (f"ROIC {roic_med:.0%} · retains {max(0.0,1-payout):.0%}"
                if fundable is not None else
                "financial company" if financial else "capital base unread"))
+
+    if pay.warning:
+        st.warning("**Check this before trusting the ceiling.** " + pay.warning)
+    if payout is not None:
+        st.caption(
+            f"**Can fund** is {money(pay.oe)} of owners' earnings a year, less the "
+            f"{money(pay.returned)} handed back — {money(pay.dividends)} of dividends and "
+            f"{money(pay.implied if pay.used_implied else pay.buybacks)} of buybacks — leaving "
+            f"{max(0.0, 1-payout):.0%} retained, reinvested at "
+            + (f"{roic_med:.0%}" if roic_med is not None else "an unreadable return")
+            + ". It is an upper bound, not a forecast: it assumes every retained dollar finds a "
+              "project as good as the business already is. A very high return on capital usually "
+              "means the business needs little capital, which is also a reason there may be "
+              "nowhere to put more of it.")
 
     if v.why == "size":
         st.error(
