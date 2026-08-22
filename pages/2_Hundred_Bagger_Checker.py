@@ -665,6 +665,48 @@ GOODWILL = [["Goodwill"]]
 INTANGIBLES = [["FiniteLivedIntangibleAssetsNet", "IntangibleAssetsNetExcludingGoodwill"]]
 
 
+TAG_LABELS = {
+    "N": "Net income", "G": "GAAP stock comp", "T": "Buybacks",
+    "Cw": "Tax withheld on vesting", "Ce": "Option / ESPP proceeds",
+    "REV": "Revenue", "INT": "Interest income", "LEASEPAY": "Finance lease payments",
+    "DIV": "Dividends paid", "CAPEX": "Capital expenditure",
+    "MA": "Shares issued for acquisitions", "OFFER": "Shares issued in offerings",
+    "CONV": "Shares from conversions",
+}
+
+
+def tag_report(facts: dict, series: dict) -> list[dict]:
+    """Which tag answered for each line, and how many years it covered.
+
+    Every silent zero in this app is a tag that did not match. H&R Block's
+    buybacks came back empty for ten straight years and the only visible
+    symptom was a payout ratio that looked like dividends alone. A line that
+    reads zero because the company did not do it and a line that reads zero
+    because this reader was looking for the wrong name are worth telling apart,
+    and only the filing can settle which is which.
+    """
+    rows = []
+    for key, (us, ifrs) in CONCEPTS.items():
+        found = ""
+        for taxonomy, concepts in (("us-gaap", us), ("ifrs-full", ifrs)):
+            for c in concepts:
+                if c in facts.get("facts", {}).get(taxonomy, {}):
+                    found = c
+                    break
+            if found:
+                break
+        n = len(series.get(key, {}))
+        rows.append({
+            "Line": TAG_LABELS.get(key, key),
+            "Years read": n,
+            "XBRL tag": found or "—",
+            "Status": ("read" if n else
+                       "tag present but no annual figures survived the filters" if found else
+                       "none of the tags this reader knows are in the filing"),
+        })
+    return rows
+
+
 def load(ticker: str, n_years: int = 10):
     """Everything this page needs, in one pass over the filings."""
     cmap = _ticker_map()
@@ -835,6 +877,7 @@ def load(ticker: str, n_years: int = 10):
         "proxy": proxy,
         "form4": _form4_count(subs),
         "cik": str(int(cik)), "fye_month": fye_month,
+        "tags": tag_report(facts, series),
     }
     return years, notes, pre
 
@@ -1600,6 +1643,26 @@ if years and ticker and st.session_state.get("hb_tk") == ticker:
             f"{use_dE:.1%}, which is how tool 1 seeds it too — the latest year as filed came in "
             f"at {plain(latest.OE)}.")
 
+        # Two tells that owners' earnings here are flattering. Both are visible
+        # in the table above, and neither announced itself before.
+        _neg = [y for y in years if y.omega < 0 and not y.excluded]
+        if pay.used_implied:
+            st.error(
+                "**Owners' earnings are overstated in this table, and so are tool 1's.** No "
+                "buyback line was read, so the market value of shares delivered to employees "
+                "floors at zero: V = max(0, buybacks + price x share change), and with buybacks "
+                "missing and the share count shrinking, that maximum is always zero. Real "
+                "repurchases are gross of the stock issued to employees, so the true cost is "
+                "positive. Both tools read this filer the same way and are wrong the same way. "
+                "The tag panel below is what to send me to fix it.")
+        elif len(_neg) >= max(2, len(years) // 3):
+            st.warning(
+                f"**The true stock-comp cost reads negative in {len(_neg)} years**, which adds to "
+                "owners' earnings rather than subtracting. That happens when option and ESPP "
+                "proceeds exceed the tax withheld on vesting — real, but it usually also means "
+                "the share-delivery term is being floored at zero because a buyback or issuance "
+                "line was not read. Treat these owners' earnings as a ceiling.")
+
         st.write("**Assumptions used** — paste this if something looks wrong")
         st.code(
             f"{tk}   price {price:,.2f}   shares {shares:,.1f}M   mkt cap {plain(mcap)}\n"
@@ -1619,6 +1682,14 @@ if years and ticker and st.session_state.get("hb_tk") == ticker:
             f"operating cash      {op_cash_pct:.1%} of revenue\n"
             f"dilution            {dilution:+.2%}/yr   horizon {horizon}y   exit {exit_mult:g}x\n"
             f"verdict             {v.label} ({v.why})", language="text")
+
+    with st.expander("What was read from the filings — every tag, found or missing"):
+        st.caption(
+            "A zero in this app is either something the company did not do or a tag this reader "
+            "does not know. Only the filing settles which, and this is where to look. If a line "
+            "you know exists reads zero years, that is a bug worth reporting — the tag name is "
+            "the whole fix.")
+        st.dataframe(pd.DataFrame(pre.get("tags", [])), width="stretch", hide_index=True)
 
 # ══════════════════════════════════════════════════════════════════════
 #  REFERENCE
