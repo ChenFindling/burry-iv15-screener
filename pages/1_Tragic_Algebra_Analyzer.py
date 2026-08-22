@@ -570,7 +570,8 @@ def reporting_currency(facts: dict, concepts: list[str]) -> str | None:
     return None
 
 
-def _instant(facts: dict, concepts: list[str], unit: str = "USD") -> dict[int, float]:
+def _instant(facts: dict, concepts: list[str], unit: str = "USD",
+             sources: list[str] | None = None) -> dict[int, float]:
     """Latest balance-sheet value per fiscal year.
 
     Concepts are tried in order and the FIRST one with data wins. Merging them
@@ -593,6 +594,8 @@ def _instant(facts: dict, concepts: list[str], unit: str = "USD") -> dict[int, f
                 if fy not in out or filed > out[fy][0]:
                     out[fy] = (filed, float(row["val"]))
             if out:
+                if sources is not None:
+                    sources.append(concept)
                 return {k: v[1] for k, v in out.items()}
     return {}
 
@@ -876,7 +879,14 @@ def load(ticker: str, n_years: int = 10):
         notes.append("No tax-withholding line found. That understates the SBC cost, so "
                      "owners' earnings here are flattering rather than conservative.")
 
-    g = lambda ks: (max(_instant(facts, ks).items(), default=(0, 0.0))[1]) / 1e6
+    _bal: dict[str, list[str]] = {}
+
+    def g(ks):
+        src: list[str] = []
+        v = (max(_instant(facts, ks, "USD", src).items(), default=(0, 0.0))[1]) / 1e6
+        _bal[ks[0]] = src
+        return v
+
     cash_total = g(BALANCE["cash"]) + g(BALANCE["sti"]) + g(BALANCE["lti"])
     debt_total = g(BALANCE["ltd"]) + g(BALANCE["std"])
     lease_total = g(BALANCE["lease"])
@@ -962,6 +972,15 @@ def load(ticker: str, n_years: int = 10):
     tags = tag_report(facts, series, tag_sources)
     _kept_oe = sorted(y.OE for y in years[-5:] if not y.excluded)
     _med = _kept_oe[len(_kept_oe) // 2] if _kept_oe else 0.0
+    tags = tags + [
+        {"Line": f"— {name}", "Years read": len(_instant(facts, ks)),
+         "XBRL tag": " + ".join(_bal.get(ks[0], [])) or "—",
+         "Status": "read" if _bal.get(ks[0]) else "none of the tags this reader knows are in "
+                                                 "the filing"}
+        for name, ks in (("Cash", BALANCE["cash"]), ("Short-term investments", BALANCE["sti"]),
+                         ("Long-term investments", BALANCE["lti"]),
+                         ("Long-term debt", BALANCE["ltd"]), ("Short-term debt", BALANCE["std"]),
+                         ("Operating leases", BALANCE["lease"]))]
     return years, notes, {"tags": tags, "net_cash": net_cash, "cash": cash_total, "debt": debt_total,
                           "median_OE": _med, "revenue": latest_rev, "cagr3": cagr3,
                           "leases": lease_total,
