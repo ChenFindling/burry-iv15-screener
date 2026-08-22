@@ -651,7 +651,8 @@ CONCEPTS = {
            ["ShareBasedPaymentsExpense"]),
     "T":  (["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity",
             "PaymentsForRepurchaseOfCommonStockAndRestrictedStockUnits",
-            "StockRepurchasedAndRetiredDuringPeriodValue"],
+            "StockRepurchasedAndRetiredDuringPeriodValue",
+            "StockRepurchasedDuringPeriodValue"],
            ["PaymentsToAcquireOrRedeemEntitysShares"]),
     "Cw": (["PaymentsRelatedToTaxWithholdingForShareBasedCompensation",
             "TreasuryStockValueAcquiredCostMethod"], []),
@@ -830,6 +831,25 @@ def load(ticker: str, n_years: int = 10):
                 "Tax withholding was read from a treasury-stock line rather than the usual "
                 "withholding tag. Filers that retire shares on repurchase report it this way. "
                 "The amounts are withholding-sized, so they were accepted.")
+
+    # A blank year inside the window is invisible in a table full of numbers.
+    # H&R Block read 12 of 19 years after the gap-filling fix, and the four
+    # blanks that remained sat in the middle of the window while the share
+    # count fell in every one of them. Nothing said so.
+    _gap = [y.fy for y in years
+            if y.fy not in series["T"] and y.dS < 0
+            and shares_out.get(y.fy - 1, 0) > 0
+            and abs(y.dS) / (shares_out[y.fy - 1] / 1e6) > 0.01]
+    if _gap:
+        notes.append(
+            "No repurchase figure was found for FY"
+            + ", FY".join(str(f) for f in _gap)
+            + ", yet the share count fell by more than 1% in each. Those years are almost "
+              "certainly buybacks tagged under an element this reader does not know. Two "
+              "consequences: owners' earnings for those years are a ceiling, since the market "
+              "value of shares delivered floors at zero without a repurchase figure; and cash "
+              "returned to shareholders is understated, which flatters the growth a company "
+              "looks able to fund. The tag panel shows which elements did answer.")
 
     if any(y.price == 0 for y in years):
         notes.append("No share price for some years — their stock-comp cost is understated, so "
