@@ -184,8 +184,39 @@ def _facts(cik: str) -> dict:
                     timeout=30).json()
 
 
-def _annual(facts: dict, us: list[str], ifrs: list[str]) -> dict[int, tuple[str, str, float]]:
-    """{fy: (start, end, value)} for full-year facts from annual reports only."""
+# Lines where a second tag means the same thing, so a gap in one can be filled
+# from another. Deliberately not net income, stock comp, revenue or share
+# counts: their alternates carry different definitions (parent-only versus
+# consolidated, per-plan versus total, ASC 606 versus legacy), and stitching
+# those across years would put a step change in a growth rate and call it
+# history.
+FILL_KEYS = {"T", "Cw", "Ce", "DIV", "INT", "LEASEPAY", "CAPEX", "MA", "OFFER", "CONV"}
+
+
+def _annual(facts: dict, us: list[str], ifrs: list[str],
+            sources: list[str] | None = None,
+            fill: bool = False) -> dict[int, tuple[str, str, float]]:
+    """{fy: (start, end, value)} for full-year facts from annual reports only.
+
+    Three filters that matter: the period must be roughly a year (so quarterly
+    rows tagged fp='FY' cannot slip through); annual forms only; and where a
+    year appears in several filings, keep the latest — a 10-K restates the
+    prior year as a comparative.
+
+    On the choice between concepts: the first one with data used to win
+    outright, and everything after it was ignored. That is right when the
+    alternates mean different things, and quietly wrong when they do not.
+    H&R Block retired shares rather than holding them as treasury, so
+    PaymentsForRepurchaseOfCommonStock covered three of nineteen years and the
+    remaining sixteen sat in StockRepurchasedAndRetiredDuringPeriodValue —
+    unread, because three years was enough to stop the search. The buyback
+    column printed zeros for a decade and every figure downstream inherited it.
+
+    With fill=True the concepts are tried in order and later ones fill only the
+    years earlier ones left empty. Priority is preserved; nothing is summed;
+    and every concept that contributed is appended to `sources` so the panel in
+    the UI can show which ones answered.
+    """
     out: dict[int, tuple[str, str, str, float]] = {}
     for taxonomy, concepts in (("us-gaap", us), ("ifrs-full", ifrs)):
         tax = facts.get("facts", {}).get(taxonomy, {})
@@ -193,6 +224,7 @@ def _annual(facts: dict, us: list[str], ifrs: list[str]) -> dict[int, tuple[str,
             if concept not in tax:
                 continue
             units = tax[concept].get("units", {})
+            got: dict[int, tuple[str, str, str, float]] = {}
             for row in units.get("USD", []) or units.get("shares", []):
                 if row.get("form") not in ANNUAL_FORMS:
                     continue
@@ -203,11 +235,16 @@ def _annual(facts: dict, us: list[str], ifrs: list[str]) -> dict[int, tuple[str,
                                - dt.date.fromisoformat(start)).days <= 400:
                     continue
                 fy, filed = int(end[:4]), row.get("filed", "")
-                if fy not in out or filed > out[fy][0]:
-                    out[fy] = (filed, start, end, float(row.get("val", 0.0)))
-            if out:
+                if fy not in got or filed > got[fy][0]:
+                    got[fy] = (filed, start, end, float(row.get("val", 0.0)))
+            fresh = {fy: v for fy, v in got.items() if fy not in out}
+            if fresh:
+                out.update(fresh)
+                if sources is not None:
+                    sources.append(concept)
+            if out and not fill:
                 return {k: (v[1], v[2], v[3]) for k, v in out.items()}
-    return {}
+    return {k: (v[1], v[2], v[3]) for k, v in out.items()}
 
 
 def reporting_currency(facts: dict, concepts: list[str]) -> str | None:
@@ -675,33 +712,32 @@ TAG_LABELS = {
 }
 
 
-def tag_report(facts: dict, series: dict) -> list[dict]:
-    """Which tag answered for each line, and how many years it covered.
+def tag_report(facts: dict, series: dict, sources: dict[str, list[str]]) -> list[dict]:
+    """Which tags answered for each line, and how many years they covered.
 
-    Every silent zero in this app is a tag that did not match. H&R Block's
-    buybacks came back empty for ten straight years and the only visible
-    symptom was a payout ratio that looked like dividends alone. A line that
-    reads zero because the company did not do it and a line that reads zero
-    because this reader was looking for the wrong name are worth telling apart,
-    and only the filing can settle which is which.
+    Every silent zero in this app is a tag that did not match. Reading the
+    panel is how the H&R Block buyback bug was found: the tag was there, it
+    covered three years of nineteen, and nothing said so.
     """
     rows = []
     for key, (us, ifrs) in CONCEPTS.items():
-        found = ""
+        used = sources.get(key, [])
+        n = len(series.get(key, {}))
+        present = ""
         for taxonomy, concepts in (("us-gaap", us), ("ifrs-full", ifrs)):
             for c in concepts:
                 if c in facts.get("facts", {}).get(taxonomy, {}):
-                    found = c
+                    present = c
                     break
-            if found:
+            if present:
                 break
-        n = len(series.get(key, {}))
         rows.append({
             "Line": TAG_LABELS.get(key, key),
             "Years read": n,
-            "XBRL tag": found or "—",
-            "Status": ("read" if n else
-                       "tag present but no annual figures survived the filters" if found else
+            "XBRL tag": " + ".join(used) if used else (present or "—"),
+            "Status": ("read" if n and len(used) <= 1 else
+                       f"read — gaps filled from {len(used)} tags" if n else
+                       "tag present but no annual figures survived the filters" if present else
                        "none of the tags this reader knows are in the filing"),
         })
     return rows
@@ -717,7 +753,9 @@ def load(ticker: str, n_years: int = 10):
     subs = _submissions(cik)
     sic, sic_desc = str(subs.get("sic", "")), str(subs.get("sicDescription", ""))
 
-    series = {k: _annual(facts, us, ifrs) for k, (us, ifrs) in CONCEPTS.items()}
+    tag_sources: dict[str, list[str]] = {k: [] for k in CONCEPTS}
+    series = {k: _annual(facts, us, ifrs, tag_sources[k], k in FILL_KEYS)
+              for k, (us, ifrs) in CONCEPTS.items()}
     if not series["N"]:
         ccy = reporting_currency(facts, CONCEPTS["N"][0] + CONCEPTS["N"][1])
         if ccy and ccy != "USD":
@@ -775,6 +813,24 @@ def load(ticker: str, n_years: int = 10):
     if non_sbc_total:
         notes.append(f"Excluded {non_sbc_total:,.1f}M shares issued for acquisitions, offerings or "
                      "conversions. Those are corporate transactions, not compensation.")
+    if "TreasuryStockValueAcquiredCostMethod" in tag_sources.get("Cw", []):
+        capped = 0
+        for y in years:
+            if y.G > 0 and y.Cw > 3 * y.G:
+                y.Cw, capped = 0.0, capped + 1
+        if capped:
+            notes.append(
+                f"A treasury-stock line was read as tax withholding, but in {capped} year(s) it "
+                "was more than three times the GAAP stock-comp charge — too large to be shares "
+                "surrendered for employee tax, and almost certainly an ordinary repurchase. Those "
+                "years were dropped rather than charged twice, once as withholding and again as "
+                "the market value of shares delivered.")
+        else:
+            notes.append(
+                "Tax withholding was read from a treasury-stock line rather than the usual "
+                "withholding tag. Filers that retire shares on repurchase report it this way. "
+                "The amounts are withholding-sized, so they were accepted.")
+
     if any(y.price == 0 for y in years):
         notes.append("No share price for some years — their stock-comp cost is understated, so "
                      "owners' earnings and ROIC read high for those years.")
@@ -877,7 +933,7 @@ def load(ticker: str, n_years: int = 10):
         "proxy": proxy,
         "form4": _form4_count(subs),
         "cik": str(int(cik)), "fye_month": fye_month,
-        "tags": tag_report(facts, series),
+        "tags": tag_report(facts, series, tag_sources),
     }
     return years, notes, pre
 
@@ -1134,6 +1190,27 @@ def self_test() -> list[tuple[str, bool, str]]:
     out.append(("Switches reconcile a Burry ROIC toward a published one",
                 r_burry.roic > 0.90 and r_conv.roic < 0.50,
                 f"{r_burry.roic:.0%} -> {r_conv.roic:.0%}"))
+
+    # 4d. The bug the tag panel found: a tag that answers for a few years and
+    #     stops the search. Built to the exact shape of H&R Block's buybacks.
+    def _rows(concept, yrs, val):
+        return {concept: {"units": {"USD": [
+            {"form": "10-K", "start": f"{y}-07-01", "end": f"{y+1}-06-30",
+             "filed": f"{y+1}-08-01", "val": val} for y in yrs]}}}
+    facts = {"facts": {"us-gaap": {
+        **_rows("PaymentsForRepurchaseOfCommonStock", range(2008, 2011), 100e6),
+        **_rows("StockRepurchasedAndRetiredDuringPeriodValue", range(2008, 2026), 500e6)}}}
+    first_wins = _annual(facts, CONCEPTS["T"][0], [], None, False)
+    filled = _annual(facts, CONCEPTS["T"][0], [], None, True)
+    out.append(("First-tag-wins read 3 years and stopped",
+                len(first_wins) == 3, f"{len(first_wins)} years"))
+    out.append(("Gap-filling reads all 18, priority preserved",
+                len(filled) == 18 and abs(filled[2009][2] - 100e6) < 1
+                and abs(filled[2020][2] - 500e6) < 1,
+                f"{len(filled)} years; 2009 from the cash-flow tag, 2020 from the retirement tag"))
+    src = []
+    _annual(facts, CONCEPTS["T"][0], [], src, True)
+    out.append(("...and both tags are named in the panel", len(src) == 2, " + ".join(src)))
 
     # 5. The verdict itself.
     v = assess(0.272, 0.075, 0.04, 5_000)
