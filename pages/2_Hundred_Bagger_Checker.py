@@ -404,6 +404,14 @@ class Pooled:
         return self.sum_N > 0
 
 
+def pool_safe(years: list[Year], fallback: "Pooled") -> "Pooled":
+    """pool() over a slice that may be empty or sum to zero net income."""
+    try:
+        return pool(years)
+    except (ValueError, ZeroDivisionError):
+        return fallback
+
+
 def pool(years: list[Year]) -> Pooled:
     years = [y for y in years if not y.excluded]
     sN = sum(y.N for y in years)
@@ -794,6 +802,10 @@ def load(ticker: str, n_years: int = 10):
         dil = cagr(shares_out[clean[0]], shares_out[clean[-1]], clean[-1] - clean[0])
 
     proxy = _latest_filing(subs, ("DEF 14A", "DEFA14A", "DEF14A"))
+    # A fiscal year ending outside November-January means the balance sheet is
+    # a snapshot taken at a busy point in the company's own cycle. H&R Block
+    # closes on 30 April, days after tax season delivers its cash.
+    fye_month = int(series["N"][fys[-1]][1][5:7]) if fys else 12
     pre = {
         "sic": sic, "sic_desc": sic_desc, "financial": is_financial(sic),
         "shares": diluted, "dilution": dil, "caps": caps, "fys": fys,
@@ -805,7 +817,7 @@ def load(ticker: str, n_years: int = 10):
         "name": subs.get("name", ticker),
         "proxy": proxy,
         "form4": _form4_count(subs),
-        "cik": str(int(cik)),
+        "cik": str(int(cik)), "fye_month": fye_month,
     }
     return years, notes, pre
 
@@ -835,6 +847,100 @@ def build_roic(years: list[Year], pre: dict, op_cash_pct: float,
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  THE VERDICT
+#
+#  One question, asked in one place: is the growth this price requires
+#  inside what the business can fund and has ever managed?
+#
+#  Three rates, and the answer is which of them is smallest:
+#    NEEDS      required_growth, from the price you pay and the multiple
+#               you assume at the end
+#    CAN FUND   ROIC x retention, plus whatever a shrinking share count
+#               adds. Capital's ceiling.
+#    HAS DONE   what it has actually delivered. History's ceiling.
+#
+#  Neither ceiling is a law. Capital's can be raised by borrowing;
+#  history's can be broken by a genuinely new business. But when the
+#  required rate sits above both, the case is closed by arithmetic
+#  rather than by opinion, and that is worth saying plainly.
+# ══════════════════════════════════════════════════════════════════════
+
+
+@dataclass
+class Verdict:
+    label: str      # short headline
+    kind: str       # streamlit method: success / warning / error / info
+    why: str        # which constraint decided it
+
+
+def assess(required: float | None, fundable: float | None,
+           delivered: float | None, mcap_m: float) -> Verdict:
+    """The whole tool, in one function, so it can be tested without a browser."""
+    if mcap_m > 0 and mcap_m * 100 > WORLD_GDP_M * 0.05:
+        return Verdict("Closed on size", "error", "size")
+    if required is None:
+        return Verdict("Cannot be computed", "error", "no earnings base")
+    if fundable is None and delivered is None:
+        return Verdict("Cannot be computed", "error", "no ceiling of either kind")
+    if fundable is not None and required > fundable:
+        return Verdict("The arithmetic does not close", "error", "capital")
+    # Fundable, but the company has never gone at anything like this rate. Both
+    # ceilings are generous here — delivered takes the better of revenue and
+    # owners' earnings — so failing this one is a real finding.
+    if delivered is not None and required > max(delivered * 1.5, delivered + 0.03):
+        return Verdict("Fundable, but unprecedented", "warning", "history")
+    if fundable is None:
+        return Verdict("Open, on history alone", "info", "no capital base")
+    if delivered is None:
+        return Verdict("Open, on capital alone", "info", "no growth history")
+    return Verdict("The arithmetic is open", "success", "both")
+
+
+def pooled_payout(years: list[Year], dividends: dict[int, float],
+                  n: int = 5) -> tuple[float | None, float]:
+    """(share of owners' earnings returned to shareholders, average buyback $M).
+
+    Pooled over several years rather than taken from the latest, for the same
+    reason ΔE is pooled in tool 1: a single year's buyback is a decision, not a
+    policy, and one big repurchase would otherwise read as permanent.
+
+    Buybacks appear on both sides of the ceiling calculation and that is not
+    double counting. They leave the numerator because a dollar returned is a
+    dollar not reinvested; they come back as a share-count effect because a
+    hundredfold on fewer shares is still a hundredfold to whoever stayed.
+    """
+    clean = [y for y in years if not y.excluded][-n:]
+    if not clean:
+        return None, 0.0
+    total_oe = sum(y.OE for y in clean)
+    buybacks = sum(y.T for y in clean)
+    returned = buybacks + sum(dividends.get(y.fy, 0.0) for y in clean)
+    return (returned / total_oe if total_oe > 0 else None), buybacks / len(clean)
+
+
+def roic_caveat(r: RoicYear, fye_month: int) -> str:
+    """One line on how solid a ROIC reading is, instead of a warning box.
+
+    Everything here was, at some point, a place the number went wrong. None of
+    them makes it worthless; all of them change how hard you should lean on it.
+    """
+    c, bits = r.cap, []
+    if r.roic is not None and r.roic > 0.50:
+        bits.append("at this level capital is not what limits growth — the payout is, and the "
+                    "ceiling already reflects that")
+    if c.total_capital > 0 and c.deployable_cash > 0.5 * c.total_capital:
+        bits.append("over half the gross capital base is cash being subtracted, so the answer "
+                    "moves a long way with the operating-cash setting")
+    if c.invested > 0 and (c.goodwill + c.intangibles) > 0.5 * c.invested:
+        bits.append("acquisitions are most of the base, so the tangible figure is the one that "
+                    "describes reinvestment")
+    if fye_month not in (11, 12, 1):
+        bits.append(f"the fiscal year ends in month {fye_month}, so the balance sheet is a "
+                    "snapshot taken mid-cycle rather than at a quiet point")
+    return "; ".join(bits)
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  SELF-TEST
 # ══════════════════════════════════════════════════════════════════════
 
@@ -852,9 +958,12 @@ def self_test() -> list[tuple[str, bool, str]]:
                 abs(ys[0].V - 8252) < 1, f"${ys[0].V:,.0f}M"))
     out.append(("Ported engine: Alphabet pooled ΔE = 88.7%",
                 abs(pool(ys).dE - 0.887) < 0.002, f"{pool(ys).dE:.2%}"))
+    # The seed both pages show: latest net income x 3-year pooled ΔE.
+    seed = ys[-1].N * pool_safe(ys[-3:], pool(ys)).dE
+    out.append(("Owners' earnings seed matches tool 1's box: $117,743M",
+                abs(seed - 117_743) < 500, f"${seed:,.0f}M"))
 
-    # 2. Mayer's arithmetic. 100x at a flat multiple over 25 years is the
-    #    figure the book leads with.
+    # 2. Mayer's arithmetic.
     g25 = required_growth(20, 20, 25)
     out.append(("100x in 25 years, flat multiple → 20.2%/yr",
                 abs(g25 - 0.2022) < 0.001, f"{g25:.2%}"))
@@ -868,33 +977,44 @@ def self_test() -> list[tuple[str, bool, str]]:
     out.append(("2%/yr dilution adds 2.4 points → 22.6%/yr",
                 abs(gd - 0.2263) < 0.001, f"{gd:.2%}"))
 
-    # 3. The ROIC ceiling.
+    # 3. The ceiling. The second of these is the H&R Block shape: a superb
+    #    return on capital that funds no growth at all, because essentially
+    #    every dollar is paid out.
     out.append(("ROIC 20%, half paid out → 10% ceiling",
                 abs(sustainable_growth(0.20, 0.5) - 0.10) < 1e-9,
                 f"{sustainable_growth(0.20, 0.5):.1%}"))
-    out.append(("Same, plus 3% of stock retired → 13.4% per share",
-                abs(per_share_ceiling(0.20, 0.5, 0.03) - 0.13402) < 0.0005,
-                f"{per_share_ceiling(0.20, 0.5, 0.03):.2%}"))
+    hrb = per_share_ceiling(1.05, 1.0, 0.07)
+    out.append(("ROIC 105% but everything paid out → 7.5%, not 105%",
+                abs(hrb - 0.0753) < 0.001, f"{hrb:.2%}"))
 
-    # 4. Burry's ROIC, wired to a hand-worked example. This checks the
-    #    plumbing, not the framework — there is no published figure to
-    #    validate against the way Alphabet validates the Tragic Algebra.
+    # 4. Burry's ROIC, wired to a hand-worked example.
     c = Capital(fy=2025, equity=800, debt=200, cash=250, revenue=2500,
                 op_cash_pct=0.02, other_capital=50)
     r = RoicYear(fy=2025, OE=100, interest_income=5, lease_payments=2, other_expense=3, cap=c)
-    #  capital 1000 - deployable (250-50) + 50 = 850 ; numerator 90
     out.append(("ROIC formula wiring: 90 / 850 → 10.59%",
                 r.roic is not None and abs(r.roic - 0.10588) < 0.0005,
                 f"{r.roic:.2%}" if r.roic else "n/a"))
     out.append(("Operating cash stays in the capital base",
                 abs(c.deployable_cash - 200) < 1e-9, f"${c.deployable_cash:,.0f}M deployable"))
-
-    # 5. The refusals.
     neg = RoicYear(fy=2025, OE=500, interest_income=0, lease_payments=0, other_expense=0,
                    cap=Capital(fy=2025, equity=-300, debt=100, cash=50, revenue=5000,
                                equity_found=True))
     out.append(("Negative capital base refuses rather than flipping sign",
                 neg.reason != "" and neg.roic is None, neg.reason or "printed a number"))
+
+    # 5. The verdict itself.
+    v = assess(0.272, 0.075, 0.04, 5_000)
+    out.append(("Needs 27%, funds 7.5% → closed by capital",
+                v.kind == "error" and v.why == "capital", f"{v.label} ({v.why})"))
+    v = assess(0.27, 0.35, 0.10, 5_000)
+    out.append(("Fundable at 35% but has only done 10% → unprecedented",
+                v.kind == "warning" and v.why == "history", f"{v.label} ({v.why})"))
+    v = assess(0.22, 0.30, 0.20, 5_000)
+    out.append(("Needs 22%, funds 30%, has done 20% → open",
+                v.kind == "success", f"{v.label} ({v.why})"))
+    v = assess(0.15, 0.90, 0.60, 4_000_000)
+    out.append(("Size closes it even when everything else passes",
+                v.why == "size", f"{v.label} ({v.why})"))
     return out
 
 
@@ -907,17 +1027,18 @@ def self_test() -> list[tuple[str, bool, str]]:
 # must be escaped. st.metric, st.code and st.dataframe are unaffected.
 
 
-def d(x, dp=2):
-    return f"\\${x:,.{dp}f}"
-
-
 def money(x: float) -> str:
-    """$M in, human-readable out."""
+    """$M in, human-readable out. Escaped, so it is safe inside markdown."""
     if abs(x) >= 1_000_000:
-        return f"${x/1_000_000:,.2f}T"
+        return f"\\${x/1_000_000:,.2f}T"
     if abs(x) >= 1_000:
-        return f"${x/1_000:,.2f}B"
-    return f"${x:,.0f}M"
+        return f"\\${x/1_000:,.2f}B"
+    return f"\\${x:,.0f}M"
+
+
+def plain(x: float) -> str:
+    """Same, unescaped, for st.metric and st.code."""
+    return money(x).replace("\\", "")
 
 
 st.set_page_config(
@@ -927,8 +1048,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 st.title("💯 100-Bagger Checker")
-st.caption("Christopher Mayer's criteria against the filings, with a fully-adjusted "
-           "return on invested capital doing the arguing")
+st.caption("What a hundredfold requires, against what this business can fund and has ever done")
 
 if not _sec_contact():
     st.warning(
@@ -941,8 +1061,9 @@ if "hb_years" not in st.session_state:
     st.info(
         "**A hundredfold is two engines multiplied: earnings growth and multiple change.** "
         "This works out the growth rate your holding period actually requires, then checks it "
-        "against the ceiling the company's own return on capital sets. When the required rate "
-        "is above the ceiling, the case is closed by arithmetic rather than by judgement.\n\n"
+        "against two ceilings — what the company's return on capital can fund, and what it has "
+        "ever delivered. Below both, the case is open. Above either, it is closed by arithmetic "
+        "rather than by opinion.\n\n"
         "Enter a US-listed ticker you already like. This is a checker, not a screener.")
 
 with st.form("hb_lookup"):
@@ -971,301 +1092,171 @@ if years and ticker and st.session_state.get("hb_tk") == ticker:
     notes = list(st.session_state["hb_notes"])
     pre = st.session_state["hb_pre"]
     tk = st.session_state["hb_tk"]
-    fys = pre["fys"]
+    fys, financial = pre["fys"], pre["financial"]
     alerts: list[tuple[str, str]] = [("info", n) for n in notes]
-
-    price = current_price(tk) or 0.0
-    shares = pre["shares"]
     latest = years[-1]
-    rev_now = pre["revenue"].get(fys[-1], 0.0)
+
+    # ── owners' earnings, seeded exactly as tool 1 seeds its box ─────
+    # Both pages run the same engine on the same filings. What differed was
+    # which figure got shown: tool 1 puts forward net income x pooled ΔE in
+    # its box, this page was showing the latest year as filed. Same formula,
+    # different year, and the two disagreed by whatever that year was unusual
+    # by. They now seed identically.
+    pooled = pool(years)
+    recent = pool_safe(years[-3:], pooled)
+    use_dE = recent.dE if 0 < recent.dE <= 1.25 else pooled.dE
+    hist_oe = sorted(y.OE for y in years[-5:] if not y.excluded)
+    median_OE = hist_oe[len(hist_oe) // 2] if hist_oe else 0.0
+    if 0 < use_dE <= 1.25:
+        seed_OE = latest.N * use_dE
+    elif median_OE > 0:
+        seed_OE = median_OE
+    else:
+        seed_OE = latest.N
 
     # ══ inputs ═══════════════════════════════════════════════════════
     st.markdown("---")
     st.subheader("Inputs")
 
     c1, c2, c3 = st.columns(3)
-    price = c1.number_input("Price", value=float(price or 100.0), step=0.01)
-    shares = c2.number_input("Diluted shares (M)", value=float(round(shares, 1)), step=1.0,
+    price = c1.number_input("Price", value=float(current_price(tk) or 100.0), step=0.01)
+    shares = c2.number_input("Diluted shares (M)", value=float(round(pre["shares"], 1)), step=1.0,
                              help="Everything per-share divides by this. Check it against the "
-                                  "market cap shown below — a missed second share class is the "
-                                  "most common reading error there is.")
+                                  "market cap below — a missed second share class is the most "
+                                  "common reading error there is.")
     OE = c3.number_input(
-        "Owners' earnings ($M)", value=float(round(latest.OE, 1)), step=1.0,
-        help="From the Tragic Algebra engine: net income, plus the GAAP stock-comp charge, less "
-             "what the stock actually cost. Override for anything non-recurring, or with the "
-             "figure you think the business earns once profitable.")
+        "Owners' earnings ($M)", value=float(round(seed_OE, 1)), step=1.0,
+        help="Seeded exactly as the IV15 tool seeds its box: latest net income times pooled ΔE. "
+             "Both pages should show the same figure for the same ticker.")
     mcap = shares * price
-    c1.caption(f"Market cap {money(mcap)}")
+
+    c4, c5, c6 = st.columns(3)
+    horizon = c4.slider("Holding period (years)", 5, 30, 20, 1,
+                        help="Mayer's study runs on 25-year holds. The requirement is brutally "
+                             "non-linear in this: five years less can add ten points a year.")
+    exit_default = (mcap / OE) if OE > 0 else 20.0
+    exit_mult = c5.number_input(
+        "Exit multiple", value=float(round(min(max(exit_default, 3.0), 60.0), 1)), step=0.5,
+        min_value=1.0,
+        help="What the market pays for a dollar of owners' earnings at the end. Seeded flat at "
+             "today's multiple, which is the honest default — assuming expansion is where most "
+             "of the wishful thinking in this arithmetic hides.")
+    dil_seed = pre.get("dilution")
+    dilution = c6.number_input(
+        "Share issuance (%/yr)",
+        value=float(round((dil_seed if dil_seed is not None else 0.015) * 100, 1)), step=0.1,
+        help="Measured from the actual share count over the window, capital events excluded. "
+             "Negative means the count is shrinking. A straight drag on your per-share "
+             "result, compounding for the whole holding period.") / 100.0
+    st.caption(
+        f"Market cap {money(mcap)} · a hundredfold is {money(mcap*100)}"
+        + (f" · trading at {mcap/OE:,.1f}x owners' earnings" if OE > 0 else "")
+        + ("" if dil_seed is not None else
+           " · share-count history too short to measure dilution, so 1.5% is a placeholder"))
 
     with st.expander("Judgement inputs — the parts EDGAR cannot answer"):
         st.caption(
             "Burry's ROIC has two terms that are not tagged anywhere in XBRL, so they are seeded "
             "at zero and left to you. Zero is not neutral: it makes the return read high.\n\n"
-            "**Other expense** covers forensic depreciation and amortisation, a normalised tax "
-            "rate and cyclical adjustment. A company under-depreciating its asset base, or "
-            "sitting on a tax rate that will not last, belongs here.\n\n"
-            "**Other capital** adds back what funds the business without appearing as capital: "
-            "purchase obligations, customer float, restricted cash and loans held for "
-            "settlement. Payroll and payments processors are the obvious cases — client funds "
-            "are somebody else's money, but they are working in the business.\n\n"
-            "**Operating cash** is the split between cash the business needs and cash you could "
-            "actually have. Burry's rule is that only the second comes out of the capital base. "
-            "He publishes no percentage; 2% of revenue is this tool's stated convention, not "
-            "his figure. Raising it lowers ROIC.")
+            "**Other expense** — forensic depreciation and amortisation, a normalised tax rate, "
+            "cyclical adjustment.\n\n"
+            "**Other capital** — what funds the business without appearing as capital: purchase "
+            "obligations, customer float, restricted cash, loans held for settlement.\n\n"
+            "**Operating cash** — the split between cash the business needs and cash you could "
+            "actually have. Only the second comes out of the capital base. Burry publishes no "
+            "percentage; 2% of revenue is this tool's convention, not his figure.")
         j1, j2, j3 = st.columns(3)
         other_expense = j1.number_input("Other expense ($M)", value=0.0, step=1.0)
         other_capital = j2.number_input("Other capital ($M)", value=0.0, step=1.0)
         op_cash_pct = j3.number_input("Operating cash (% of revenue)", value=2.0, step=0.5,
                                       min_value=0.0, max_value=25.0) / 100.0
-        st.caption("Both dollar figures apply to the latest year only. Spreading one forensic "
-                   "estimate back over a decade would move the historical trend, which is the "
-                   "one thing on this page that is pure arithmetic.")
 
+    # ── the three rates ──────────────────────────────────────────────
     rows = build_roic(years, pre, op_cash_pct, other_expense, other_capital)
+    rows[-1].OE = OE                      # latest year follows the box above
+    rows[-1].other_expense = other_expense
     latest_r = rows[-1]
-    roic_now = latest_r.roic
-    roic_med = median_roic(rows, 5)
-    financial = pre["financial"]
+    roic_med = None if financial else median_roic(rows, 5)
 
-    # Cash returned to shareholders, as a share of owners' earnings. This is the
-    # reinvestment rate's complement and it sets the growth ceiling.
-    div_now = pre["dividends"].get(fys[-1], 0.0)
-    buyback_now = latest.T
-    payout = (div_now + buyback_now) / OE if OE > 0 else 0.0
-    buyback_yield = buyback_now / mcap if mcap > 0 else 0.0
+    payout, avg_buyback = pooled_payout(years, pre["dividends"], 5)
+    buyback_yield = avg_buyback / mcap if mcap > 0 else 0.0
+    fundable = (per_share_ceiling(roic_med, payout, buyback_yield)
+                if roic_med is not None and payout is not None else None)
 
-    e1, e2 = st.columns(2)
-    horizon = e1.slider("Holding period (years)", 5, 30, 20, 1,
-                        help="Mayer's own study runs on 25-year holding periods. Shorter needs a "
-                             "faster rate, and the requirement is brutally non-linear.")
-    exit_default = (price * shares / OE) if OE > 0 else 20.0
-    exit_mult = e2.number_input(
-        "Exit multiple on owners' earnings", value=float(round(min(max(exit_default, 3.0), 60.0), 1)),
-        step=0.5, min_value=1.0,
-        help="What the market pays for a dollar of owners' earnings at the end. Seeded flat at "
-             "today's multiple, which is the honest default — assuming expansion is where most "
-             "of the wishful thinking in this arithmetic hides.")
-    dil_seed = pre.get("dilution")
-    dilution = st.slider(
-        "Net annual share issuance (%)", -6.0, 12.0,
-        float(round((dil_seed or 0.0) * 100, 1)) if dil_seed is not None else 1.5, 0.1,
-        help="Seeded from the actual share count over the window, capital events excluded. "
-             "Negative means the count is shrinking. This is a straight drag on your per-share "
-             "result and it compounds for the whole holding period.") / 100.0
-    if dil_seed is None:
-        st.caption("Share-count history was too short or too broken to measure dilution — the "
-                   "1.5% above is a placeholder, not a measurement.")
+    rev_hist = [pre["revenue"][fy] for fy in fys if pre["revenue"].get(fy)]
+    rev_cagr = cagr(rev_hist[0], rev_hist[-1], len(rev_hist) - 1) if len(rev_hist) >= 3 else None
+    oe_clean = [y for y in years if not y.excluded]
+    oe_cagr = (cagr(oe_clean[0].OE, oe_clean[-1].OE, oe_clean[-1].fy - oe_clean[0].fy)
+               if len(oe_clean) >= 3 else None)
+    # Deliberately generous: the better of the two. A refusal that survives the
+    # kindest reading of the history is a refusal worth trusting.
+    delivered = max([g for g in (rev_cagr, oe_cagr) if g is not None], default=None)
 
-    # ══ the arithmetic ═══════════════════════════════════════════════
+    required = (required_growth(mcap / OE, exit_mult, horizon, 100.0, dilution)
+                if OE > 0 and mcap > 0 else None)
+    v = assess(required, fundable, delivered, mcap)
+
+    # ══ verdict ══════════════════════════════════════════════════════
     st.markdown("---")
-    st.subheader(f"The arithmetic · {tk}")
+    st.subheader(f"Verdict · {tk}")
 
-    if OE <= 0:
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Needs", f"{required:.1%}" if required is not None else "—",
+              f"100x in {horizon}y at {exit_mult:g}x")
+    m2.metric("Has delivered", f"{delivered:.1%}" if delivered is not None else "n/a",
+              (f"revenue {rev_cagr:.0%}" if rev_cagr is not None else "revenue n/a")
+              + (f" · OE {oe_cagr:.0%}" if oe_cagr is not None else ""))
+    m3.metric("Can fund", f"{fundable:.1%}" if fundable is not None else "n/a",
+              (f"ROIC {roic_med:.0%} · retains {max(0.0,1-payout):.0%}"
+               if fundable is not None else
+               "financial company" if financial else "capital base unread"))
+
+    if v.why == "size":
         st.error(
-            f"**No entry multiple exists.** Owners' earnings are {d(OE,0)}M, and Mayer's "
-            "arithmetic is a ratio of what you pay to what the business earns. A hundredfold "
-            "from a loss is not a calculation, it is a story about a recovery. Enter the "
-            "owners' earnings you believe the business reaches in a normal year and the "
-            "arithmetic below will mean something.")
-    elif shares <= 0 or price <= 0:
-        st.error("Enter a price and a share count — every figure below divides by them.")
-    else:
-        mult_now = mcap / OE
-        req = required_growth(mult_now, exit_mult, horizon, 100.0, dilution)
-        ceiling = (per_share_ceiling(roic_med, payout, buyback_yield)
-                   if roic_med is not None and not financial else None)
-
-        a1, a2, a3 = st.columns(3)
-        a1.metric("Market cap", money(mcap), f"100x = {money(mcap*100)}")
-        a2.metric("Growth needed", f"{req:.1%}" if req else "—",
-                  f"in owners' earnings, for {horizon}y")
-        a3.metric("ROIC ceiling", f"{ceiling:.1%}" if ceiling is not None else "n/a",
-                  "what capital allows" if ceiling is not None else "see below")
-
-        if mcap * 100 > WORLD_GDP_M * 0.05:
-            st.error(
-                f"**Size closes this before growth does.** A hundredfold on {money(mcap)} is "
-                f"{money(mcap*100)} — against a world economy of roughly \\$110 trillion. "
-                "Mayer's whole point is that the base has to be small enough for the arithmetic "
-                "to have somewhere to go. Nothing below rescues this.")
-        elif req is None:
-            st.warning("Required growth could not be computed from these inputs.")
-        elif ceiling is None:
-            st.warning(
-                f"**{req:.1%} a year for {horizon} years, and no ceiling to check it against.** "
-                + ("Return on capital is not shown for financials — see the ROIC section. "
-                   if financial else
-                   "The capital base could not be read, so the one number that would tell you "
-                   "whether that rate is fundable is missing. ")
-                + "Judge the growth rate on its own and treat this page as incomplete.")
-        elif req > ceiling:
-            st.error(
-                f"**The arithmetic does not close.** A hundredfold in {horizon} years needs "
-                f"{req:.1%} a year in owners' earnings. Reinvesting at a {roic_med:.1%} return "
-                f"on capital"
-                + (f", after returning {payout:.0%} of earnings to shareholders," if payout > 0.02
-                   else "")
-                + f" funds about {ceiling:.1%}. The gap has to come from outside — debt, which "
-                  "runs out, or stock, which is the dilution term you already set. This is not a "
-                  "verdict on the business. It is a statement that this holding period and this "
-                  "entry multiple cannot get there together.")
-        else:
-            st.success(
-                f"**The arithmetic closes.** {req:.1%} a year is inside the {ceiling:.1%} that a "
-                f"{roic_med:.1%} return on capital funds from its own profits. That makes the "
-                "hundredfold possible, not likely — everything now turns on whether the return "
-                "on capital and the runway both last, which no filing can tell you.")
-
-        st.write("**What it takes, at each exit multiple** — required growth in owners' earnings")
-        cols = [10.0, 15.0, 20.0, 25.0, 30.0]
-        grid = []
-        for h in (10, 15, 20, 25):
-            row = {"Held for": f"{h} years"}
-            for m in cols:
-                g = required_growth(mult_now, m, h, 100.0, dilution)
-                if g is None:
-                    row[f"{m:g}x"] = "—"
-                elif ceiling is not None and g > ceiling:
-                    row[f"{m:g}x"] = f"{g:.0%} ✗"
-                else:
-                    row[f"{m:g}x"] = f"{g:.0%}"
-            grid.append(row)
-        st.dataframe(pd.DataFrame(grid), width="stretch", hide_index=True)
-        st.caption(
-            f"Today's multiple is {mult_now:,.1f}x owners' earnings, and dilution of "
-            f"{dilution:.1%} a year is included. "
-            + (f"A ✗ marks a rate above the {ceiling:.1%} the capital base funds. "
-               if ceiling is not None else "")
-            + "Notice how much work the exit multiple does: buying cheap and selling dear is "
-              "half of Mayer's engine, and it is the half you control at purchase.")
-
-    # ══ ROIC ═════════════════════════════════════════════════════════
-    st.markdown("---")
-    st.subheader("Return on invested capital")
-
-    if financial:
+            f"**{v.label}.** A hundredfold on {money(mcap)} is {money(mcap*100)}, against a world "
+            "economy of roughly \\$110 trillion. Mayer's whole point is that the base has to be "
+            "small enough for the arithmetic to have somewhere to go. Nothing below rescues this.")
+    elif v.why == "no earnings base":
         st.error(
-            f"**Not shown for financials.** {pre['sic_desc'] or 'This company'} (SIC "
-            f"{pre['sic']}) runs on leverage as its product rather than as a financing choice. "
-            "Equity plus borrowings is not capital at work, and its cash is not free — it backs "
-            "deposits or policyholder liabilities. Return on equity against a combined ratio or "
-            "a net interest margin is the right frame, and this tool does not contain it.")
-    elif roic_now is None or latest_r.reason:
-        _w = latest_r.cap
-        _why = ""
-        if _w.invested <= 0 and _w.equity_found:
-            if _w.equity < 0:
-                _why = ("\n\nEquity is negative, which for a profitable company almost always "
-                        "means buybacks have retired more capital than the balance sheet "
-                        "carries. That is usually strength rather than distress — the business "
-                        "funds itself and returns the rest — but a return on a negative "
-                        "denominator flips sign, so nothing is printed. Judge reinvestment by "
-                        "cash flow instead.")
-            elif _w.deployable_cash > _w.total_capital:
-                _why = (f"\n\nThe cause here is cash, not losses: {money(_w.deployable_cash)} of "
-                        f"deployable cash against {money(_w.total_capital)} of total capital. "
-                        "The operating business runs on less than nothing, which is a genuinely "
-                        "excellent property and not a computable one. Two things to check before "
-                        "accepting it — that the cash really is deployable rather than earmarked "
-                        "for an acquisition or a trial, and that the share count is right, since "
-                        "a missed share class inflates nothing but makes everything else look "
-                        "strange. Raising the operating-cash percentage above will keep more of "
-                        "it in the base if you think the business needs it.")
-            else:
-                _why = ("\n\nCapital at or below zero, with equity positive — the subtractions "
-                        "have outrun the base. Check the waterfall against the balance sheet.")
-        st.error(f"**ROIC is n/a for FY{latest_r.fy} — {latest_r.reason or 'capital base unread'}.**"
-                 + _why)
+            f"**{v.label}.** Owners' earnings are {money(OE)}, and Mayer's arithmetic is a ratio "
+            "of what you pay to what the business earns. A hundredfold from a loss is not a "
+            "calculation, it is a story about a recovery. Enter the owners' earnings you believe "
+            "the business reaches in a normal year and this page will mean something.")
+    elif v.why == "capital":
+        st.error(
+            f"**{v.label}.** A hundredfold in {horizon} years needs {required:.1%} a year in "
+            f"owners' earnings. This business funds about {fundable:.1%}"
+            + (f" — it earns {roic_med:.0%} on capital but returns {payout:.0%} of its earnings "
+               "to shareholders, so the compounding happens in your dividend and your share of "
+               "the company, not in the earnings themselves."
+               if payout is not None and payout > 0.6 else
+               f" from a {roic_med:.0%} return on capital with {max(0.0,1-payout):.0%} retained.")
+            + " The gap would have to come from outside — debt, which runs out, or stock, which "
+              "is the dilution you already set. Raising the exit multiple is the only other "
+              "lever, and that is a bet on the market, not on the business.")
+    elif v.why == "history":
+        st.warning(
+            f"**{v.label}.** {required:.1%} a year is inside the {fundable:.1%} its capital could "
+            f"fund, but the company has delivered {delivered:.1%} — and that is the kinder of its "
+            "revenue and owners'-earnings rates. It has never grown at the rate this price "
+            "requires. Not impossible; it is a bet on an inflection, and you should be able to "
+            "say what causes it.")
+    elif v.kind == "success":
+        st.success(
+            f"**{v.label}.** {required:.1%} a year sits inside both ceilings — the {fundable:.1%} "
+            f"its capital funds and the {delivered:.1%} it has delivered. That makes a "
+            "hundredfold possible, not likely. Everything now turns on how long the return on "
+            "capital and the runway last, which no filing can tell you.")
     else:
-        r1, r2, r3 = st.columns(3)
-        r1.metric("ROIC", f"{roic_now:.1%}", f"FY{latest_r.fy}")
-        _readable = len([r for r in rows[-5:] if not r.reason and r.roic is not None])
-        r2.metric("Median, 5 years", f"{roic_med:.1%}" if roic_med is not None else "—",
-                  f"{_readable} of {len(rows[-5:])} years readable")
-        tang = latest_r.tangible_roic
-        r3.metric("Ex-goodwill", f"{tang:.1%}" if tang is not None else "n/a",
-                  "return on tangible capital")
-        if roic_now > 1.0:
-            st.warning(
-                f"**{roic_now:.0%} is either a capital-light franchise or a reading error.** "
-                "Both exist. Businesses that collect cash before they spend it genuinely earn "
-                "these returns; so do companies whose capital base was mis-assembled. Check the "
-                "waterfall below against the balance sheet before believing it.")
-        if tang is None and latest_r.cap.invested > 0:
-            st.info(
-                f"Ex-goodwill is n/a because goodwill and acquired intangibles of "
-                f"{money(latest_r.cap.goodwill + latest_r.cap.intangibles)} exceed the whole "
-                f"{money(latest_r.cap.invested)} capital base. The tangible business is "
-                "carrying less capital than the company paid for acquisitions — common in "
-                "roll-ups, and the reason the all-in figure is the one to judge management by.")
-        if tang is not None and roic_now is not None and tang > roic_now * 2:
-            st.info(
-                f"Return on tangible capital is {tang:.0%} against {roic_now:.0%} all-in, so "
-                "goodwill and acquired intangibles are most of the capital base. The tangible "
-                "figure is what tells you the return on the next dollar reinvested; the all-in "
-                "figure is what tells you how well the acquisitions were priced.")
+        st.info(
+            f"**{v.label}.** {required:.1%} a year, checked against only one ceiling — "
+            + ("no growth history long enough to measure." if v.why == "no growth history" else
+               "the capital base could not be read, so there is no funding ceiling to test.")
+            + " Treat this page as incomplete for this company.")
 
-    if not financial:
-        st.write("**Burry's formula, line by line** — latest year")
-        w = latest_r.cap
-        wf = [
-            ("Owners' earnings", latest_r.OE, "from the Tragic Algebra engine"),
-            ("less interest income", -latest_r.interest_income,
-             "the cash left the denominator, so its income leaves the numerator"),
-            ("less capital lease payments", -latest_r.lease_payments,
-             "a financing outflow earnings never saw"),
-            ("less other expense", -latest_r.other_expense,
-             "forensic D&A, normalised tax, cyclical — yours to set"),
-            ("= adjusted return", latest_r.numerator, ""),
-            ("Shareholders' equity", w.equity, "parent's share" if w.minority else ""),
-            ("plus borrowings", w.debt, "short and long term"),
-            ("plus finance leases", w.finance_leases, "capitalised leases are debt in all but name"),
-            ("= total capital", w.total_capital, ""),
-            ("less deployable cash", -w.deployable_cash,
-             f"of {money(w.cash)} held; {money(w.op_cash_need)} kept in as working cash"),
-            ("plus other capital", w.other_capital, "float, obligations, restricted — yours to set"),
-            ("= invested capital", w.invested, ""),
-        ]
-        st.dataframe(
-            pd.DataFrame([{"Line": a, "$M": b, "Why": c} for a, b, c in wf])
-            .style.format({"$M": "{:,.0f}"}), width="stretch", hide_index=True)
-        st.caption(
-            f"Long-term operating leases of {money(w.operating_leases)} are **not** subtracted "
-            "here, and that is deliberate: Burry's formula takes them out of a total-capital "
-            "figure that included them. This capital base is built from equity and borrowings, "
-            "which never included them, so subtracting again would count them twice. Restricted "
-            f"cash of {money(w.restricted)} stays in the base for the same reason it always "
-            "should — it funds the business and you cannot have it.")
-
-        hist = [{"FY": r.fy, "Owners' earnings": r.OE, "Invested capital": r.cap.invested,
-                 "ROIC": r.roic if not r.reason else None,
-                 "Ex-goodwill": r.tangible_roic if not r.reason else None,
-                 "Revenue": r.cap.revenue,
-                 "n/a because": r.reason} for r in rows]
-        st.write("**Year by year** — the trend matters more than the level")
-        st.dataframe(pd.DataFrame(hist).style.format(
-            {"Owners' earnings": "{:,.0f}", "Invested capital": "{:,.0f}", "Revenue": "{:,.0f}",
-             "ROIC": "{:.1%}", "Ex-goodwill": "{:.1%}"}, na_rep="n/a"),
-            width="stretch", hide_index=True)
-        good = [r.roic for r in rows if not r.reason and r.roic is not None]
-        if good:
-            st.caption(
-                f"{sum(1 for v in good if v >= 0.15)} of {len(good)} readable years at or above "
-                f"15%, {sum(1 for v in good if v >= 0.20)} at or above 20%. Capital is measured "
-                "at the year end rather than averaged, which understates the return for anything "
-                "growing its asset base quickly — the conservative direction, and the one "
-                "Burry's formula reads literally.")
-
-    # ══ Mayer's criteria ═════════════════════════════════════════════
+    # ══ criteria ═════════════════════════════════════════════════════
     st.markdown("---")
     st.subheader("Mayer's criteria")
-
-    rev_hist = [pre["revenue"].get(fy) for fy in fys if pre["revenue"].get(fy)]
-    rev_cagr = (cagr(rev_hist[0], rev_hist[-1], len(rev_hist) - 1) if len(rev_hist) >= 3 else None)
-    oe_years = [y for y in years if not y.excluded]
-    oe_cagr = (cagr(oe_years[0].OE, oe_years[-1].OE, oe_years[-1].fy - oe_years[0].fy)
-               if len(oe_years) >= 3 and oe_years[0].OE > 0 and oe_years[-1].OE > 0 else None)
-    up_years = sum(1 for a, b in zip(rev_hist, rev_hist[1:]) if b > a)
 
     insider = st.number_input(
         "Insider ownership (%) — from the proxy", value=0.0, step=0.5,
@@ -1273,108 +1264,204 @@ if years and ticker and st.session_state.get("hb_tk") == ticker:
         help="Never tagged in XBRL. It lives in the beneficial ownership table of the DEF 14A, "
              "linked below. Type what you find there and it joins the table.")
 
+    up_years = sum(1 for a, b in zip(rev_hist, rev_hist[1:]) if b > a)
+    readable = [r for r in rows if not r.reason]
     facts_rows = [
         {"Criterion": "Small base",
-         "What the filings say": f"{money(mcap)} market cap, {money(rev_now)} revenue"
-                                 if mcap > 0 else "no price or share count",
+         "Filings": f"{plain(mcap)} cap, {plain(pre['revenue'].get(fys[-1], 0.0))} revenue"
+                    if mcap > 0 else "no price or share count",
          "Reading": size_band(mcap) if mcap > 0 else "n/a"},
-        {"Criterion": "High return on capital",
-         "What the filings say": (f"{roic_med:.1%} median over 5 years"
-                                  if roic_med is not None else "n/a"),
+        {"Criterion": "Return on capital",
+         "Filings": f"{roic_med:.1%} median, 5 years" if roic_med is not None else "n/a",
          "Reading": ("n/a — financial company" if financial else
-                     "n/a — " + (latest_r.reason or "capital base unread")
-                     if roic_med is None else
-                     "high — reinvestment compounds" if roic_med >= 0.20 else
-                     "adequate" if roic_med >= 0.12 else
-                     "too low to compound from")},
+                     "n/a — " + (latest_r.reason or "capital base unread") if roic_med is None
+                     else "high — reinvestment compounds" if roic_med >= 0.20
+                     else "adequate" if roic_med >= 0.12 else "too low to compound from")},
+        {"Criterion": "Reinvests it",
+         "Filings": f"returns {payout:.0%} of owners' earnings" if payout is not None else "n/a",
+         "Reading": ("n/a — owners' earnings negative over the window" if payout is None
+                     else "distributes nearly everything — a payer, not a compounder"
+                     if payout > 0.8 else "retains most of it" if payout < 0.35 else "mixed")},
         {"Criterion": "Sustained, not a spike",
-         "What the filings say": (f"{sum(1 for r in rows if not r.reason and r.roic and r.roic >= 0.15)}"
-                                  f" of {len([r for r in rows if not r.reason])} years above 15%"
-                                  if any(not r.reason for r in rows) and not financial else "n/a"),
-         "Reading": "the year-by-year table above is the evidence"},
+         "Filings": (f"{sum(1 for r in readable if r.roic and r.roic >= 0.15)} of {len(readable)}"
+                     " years above 15%" if readable and not financial else "n/a"),
+         "Reading": "the year-by-year table is the evidence"},
         {"Criterion": "Durable growth",
-         "What the filings say": (f"revenue {rev_cagr:.1%}/yr over {len(rev_hist)-1} years, "
-                                  f"up in {up_years} of {len(rev_hist)-1}"
-                                  if rev_cagr is not None else "too few years of revenue"),
+         "Filings": (f"revenue {rev_cagr:.1%}/yr, up in {up_years} of {len(rev_hist)-1}"
+                     if rev_cagr is not None else "too few years of revenue"),
          "Reading": (f"owners' earnings {oe_cagr:.1%}/yr" if oe_cagr is not None
                      else "owners' earnings growth n/a — negative at one end")},
-        {"Criterion": "Reasonable entry multiple",
-         "What the filings say": (f"{mcap/OE:,.1f}x owners' earnings" if OE > 0 and mcap > 0
-                                  else "n/a — no positive owners' earnings"),
-         "Reading": ("half the engine, and the half you control at purchase"
-                     if OE > 0 else "n/a")},
-        {"Criterion": "Owner-operator",
-         "What the filings say": "not in XBRL — read the proxy",
-         "Reading": "n/a — no filing tags founder involvement"},
-        {"Criterion": "Insider ownership",
-         "What the filings say": (f"{insider:.1f}% — your figure" if insider > 0
-                                  else "not in XBRL — read the proxy"),
-         "Reading": ("aligned — Mayer's threshold territory" if insider >= 10 else
-                     "some skin in the game" if insider >= 3 else
-                     "low, if that is the whole picture" if insider > 0 else "n/a")},
+        {"Criterion": "Entry multiple",
+         "Filings": f"{mcap/OE:,.1f}x owners' earnings" if OE > 0 and mcap > 0 else "n/a",
+         "Reading": "half the engine, and the half you control at purchase"},
         {"Criterion": "Dilution",
-         "What the filings say": (f"{dil_seed:+.1%}/yr share count"
-                                  if dil_seed is not None else "history too short"),
+         "Filings": f"{dil_seed:+.1%}/yr share count" if dil_seed is not None
+                    else "history too short",
          "Reading": ("retiring stock — a tailwind" if dil_seed is not None and dil_seed < 0 else
                      "modest" if dil_seed is not None and dil_seed < 0.02 else
                      "heavy — it compounds against you" if dil_seed is not None else "n/a")},
+        {"Criterion": "Owner-operator",
+         "Filings": "not in XBRL — read the proxy",
+         "Reading": "n/a — no filing tags founder involvement"},
+        {"Criterion": "Insider ownership",
+         "Filings": f"{insider:.1f}% — your figure" if insider > 0 else "not in XBRL",
+         "Reading": ("aligned" if insider >= 10 else "some skin in the game" if insider >= 3
+                     else "low, if that is the whole picture" if insider > 0 else "n/a")},
     ]
     st.dataframe(pd.DataFrame(facts_rows), width="stretch", hide_index=True)
 
     p1, p2 = st.columns(2)
     if pre.get("proxy"):
         url, date = pre["proxy"]
-        p1.markdown(f"[Latest proxy statement (DEF 14A), filed {date}]({url})")
-        p1.caption("Beneficial ownership table — insider percentage, founder holdings, and who "
-                   "actually controls the vote.")
+        p1.markdown(f"[Proxy statement (DEF 14A), filed {date}]({url})")
+        p1.caption("Beneficial ownership table — insider percentage, founder holdings, who "
+                   "controls the vote.")
     else:
         p1.caption("No DEF 14A found. Foreign private issuers do not file proxies; a recent "
                    "listing may not have filed its first one yet.")
-    p2.markdown(f"[Insider transactions (Form 4) on EDGAR]"
+    p2.markdown(f"[Insider transactions (Form 4)]"
                 f"(https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={pre['cik']}"
                 f"&type=4&dateb=&owner=include&count=40)")
-    p2.caption(f"{pre['form4']} Form 4 filings in the last twelve months. A count is not a "
-               "signal — open them and see whether anyone bought with their own money.")
+    p2.caption(f"{pre['form4']} filings in the last twelve months. A count is not a signal — "
+               "open them and see whether anyone bought with their own money.")
 
-    st.info(
-        "**Two criteria stay blank on purpose.** Owner-operator and insider ownership are not "
-        "tagged anywhere in XBRL, and every method for inferring them from structured data is a "
-        "guess dressed as a measurement. They are also, in Mayer's account, among the ones that "
-        "matter most. The links above go straight to where the answers actually are.")
-
-    # ══ feed to tool 1 ═══════════════════════════════════════════════
+    # ══ detail, all folded away ══════════════════════════════════════
     st.markdown("---")
+
+    with st.expander("What it would take at other exit multiples"):
+        if required is not None:
+            mult_now = mcap / OE
+            grid = []
+            for h in (10, 15, 20, 25):
+                row = {"Held for": f"{h} years"}
+                for m in (10.0, 15.0, 20.0, 25.0, 30.0):
+                    g = required_growth(mult_now, m, h, 100.0, dilution)
+                    row[f"{m:g}x"] = ("—" if g is None else
+                                      f"{g:.0%} ✗" if fundable is not None and g > fundable
+                                      else f"{g:.0%}")
+                grid.append(row)
+            st.dataframe(pd.DataFrame(grid), width="stretch", hide_index=True)
+            st.caption(
+                f"Required growth in owners' earnings. Today's multiple is {mult_now:,.1f}x and "
+                f"{dilution:.1%} annual issuance is included. "
+                + (f"A ✗ marks a rate above the {fundable:.1%} this business can fund. "
+                   if fundable is not None else "")
+                + "Notice how much work the exit multiple does — buying cheap and selling dear "
+                  "is half of Mayer's engine, and it is the half you fix at purchase.")
+        else:
+            st.caption("Needs a positive owners' earnings figure.")
+
+    with st.expander("Return on invested capital — Burry's formula, line by line"):
+        if financial:
+            st.error(
+                f"**Not shown for financials.** {pre['sic_desc'] or 'This company'} (SIC "
+                f"{pre['sic']}) runs on leverage as its product rather than as a financing "
+                "choice. Equity plus borrowings is not capital at work, and its cash is not "
+                "free — it backs deposits or policyholder liabilities. Return on equity against "
+                "a combined ratio or a net interest margin is the right frame, and this tool "
+                "does not contain it.")
+        elif latest_r.reason:
+            w = latest_r.cap
+            st.error(f"**n/a for FY{latest_r.fy} — {latest_r.reason}.**"
+                     + ("\n\nEquity is negative, which for a profitable company almost always "
+                        "means buybacks have retired more capital than the balance sheet "
+                        "carries. Usually strength rather than distress, but a return on a "
+                        "negative denominator flips sign, so nothing is printed."
+                        if w.equity < 0 and w.equity_found else
+                        f"\n\nThe cause is cash, not losses: {money(w.deployable_cash)} "
+                        f"deployable against {money(w.total_capital)} of total capital. The "
+                        "operating business runs on less than nothing — a genuinely excellent "
+                        "property and not a computable one. Check that the cash really is "
+                        "deployable rather than earmarked, and raise the operating-cash "
+                        "percentage if the business needs more of it."
+                        if w.deployable_cash > w.total_capital and w.equity_found else ""))
+        else:
+            k1, k2, k3 = st.columns(3)
+            k1.metric("ROIC", f"{latest_r.roic:.1%}", f"FY{latest_r.fy}")
+            k2.metric("Median, 5 years", f"{roic_med:.1%}" if roic_med is not None else "—",
+                      f"{len([r for r in rows[-5:] if not r.reason])} of {len(rows[-5:])} readable")
+            tang = latest_r.tangible_roic
+            k3.metric("Ex-goodwill", f"{tang:.1%}" if tang is not None else "n/a",
+                      "return on tangible capital")
+            cav = roic_caveat(latest_r, pre.get("fye_month", 12))
+            if cav:
+                st.caption("How hard to lean on this: " + cav + ".")
+
+            w = latest_r.cap
+            wf = [
+                ("Owners' earnings", latest_r.OE, "the figure in the box above"),
+                ("less interest income", -latest_r.interest_income,
+                 "the cash left the denominator, so its income leaves the numerator"),
+                ("less capital lease payments", -latest_r.lease_payments,
+                 "a financing outflow earnings never saw"),
+                ("less other expense", -latest_r.other_expense,
+                 "forensic D&A, normalised tax, cyclical — yours to set"),
+                ("= adjusted return", latest_r.numerator, ""),
+                ("Shareholders' equity", w.equity, "parent's share" if w.minority else ""),
+                ("plus borrowings", w.debt, "short and long term"),
+                ("plus finance leases", w.finance_leases, "capitalised leases are debt in all "
+                                                          "but name"),
+                ("= total capital", w.total_capital, ""),
+                ("less deployable cash", -w.deployable_cash,
+                 f"of {plain(w.cash)} held; {plain(w.op_cash_need)} kept in as working cash"),
+                ("plus other capital", w.other_capital, "float, obligations — yours to set"),
+                ("= invested capital", w.invested, ""),
+            ]
+            st.dataframe(
+                pd.DataFrame([{"Line": a, "$M": b, "Why": c} for a, b, c in wf])
+                .style.format({"$M": "{:,.0f}"}), width="stretch", hide_index=True)
+            st.caption(
+                f"Long-term operating leases of {money(w.operating_leases)} are **not** "
+                "subtracted, and that is deliberate: Burry's formula removes them from a "
+                "total-capital figure that included them. This base is equity plus borrowings, "
+                "which never did, so subtracting again would count them twice. Restricted cash "
+                f"of {money(w.restricted)} stays in for the reason it always should — it funds "
+                "the business and you cannot have it.")
+
+            st.write("**Year by year** — the trend matters more than the level")
+            st.dataframe(pd.DataFrame([{
+                "FY": r.fy, "Owners' earnings": r.OE, "Invested capital": r.cap.invested,
+                "ROIC": r.roic if not r.reason else None,
+                "Ex-goodwill": r.tangible_roic if not r.reason else None,
+                "n/a because": r.reason} for r in rows]).style.format(
+                {"Owners' earnings": "{:,.0f}", "Invested capital": "{:,.0f}",
+                 "ROIC": "{:.1%}", "Ex-goodwill": "{:.1%}"}, na_rep="n/a"),
+                width="stretch", hide_index=True)
+            st.caption(
+                f"FY{latest_r.fy} uses the owners' earnings figure from the input box; earlier "
+                "years are as filed. Capital is measured at each year end rather than averaged, "
+                "which understates the return for anything growing its asset base quickly — the "
+                "conservative direction, and the one Burry's formula reads literally.")
+
     with st.expander("Feed this into the IV15 tool"):
         st.caption(
             "The Tragic Algebra Analyzer asks for a growth rate and has no way to sanity-check "
-            "it — it seeds from revenue, which is why the note there says return on capital is "
-            "the real ceiling. This is that ceiling, computed.")
-        if roic_med is not None and not financial:
+            "it. This is that ceiling, computed.")
+        if roic_med is not None and payout is not None:
             g_ceiling = sustainable_growth(roic_med, payout)
             st.code(
                 f"{tk}\n"
-                f"owners' earnings     {OE:,.0f} M\n"
+                f"owners' earnings     {OE:,.0f} M      <- same figure tool 1 seeds\n"
                 f"shares               {shares:,.1f} M\n"
                 f"ROIC, 5y median      {roic_med:.1%}\n"
                 f"cash returned        {payout:.0%} of owners' earnings\n"
                 f"growth ceiling       {g_ceiling:.1%}   <- do not exceed this in tool 1\n"
-                f"per-share ceiling    {per_share_ceiling(roic_med, payout, buyback_yield):.1%}"
-                f"   (includes buybacks)", language="text")
+                f"per-share ceiling    {fundable:.1%}   (adds the buyback effect)",
+                language="text")
             st.caption(
-                f"A growth rate above {g_ceiling:.1%} in tool 1 is a claim that this company will "
-                "fund expansion from outside — a rights issue, more debt, or stock. Sometimes "
-                "true, always worth stating out loud rather than assuming.")
+                f"A growth rate above {g_ceiling:.1%} in tool 1 is a claim that this company "
+                "funds expansion from outside — more debt, or stock. Sometimes true, always "
+                "worth stating out loud rather than assuming.")
         else:
-            st.warning("No ROIC, so no ceiling. Tool 1's growth input stays unconstrained here.")
+            st.warning("No ROIC or no positive earnings base, so no ceiling. Tool 1's growth "
+                       "input stays unconstrained here.")
 
-    # ══ detail ═══════════════════════════════════════════════════════
-    st.markdown("---")
     label = "Notes and detail" + (f" · {len(alerts)} to review" if alerts else "")
     with st.expander(label):
         for kind_, msg in alerts:
             getattr(st, kind_)(msg)
 
-        st.write("**Owners' earnings, year by year**")
+        st.write("**Owners' earnings, year by year** — identical to tool 1 for the same ticker")
         st.dataframe(pd.DataFrame([{
             "FY": f"{y.fy}*" if y.excluded else str(y.fy),
             "Net income": y.N, "GAAP SBC": y.G, "Buybacks": y.T, "Share change": y.dS,
@@ -1384,23 +1471,31 @@ if years and ticker and st.session_state.get("hb_tk") == ticker:
                 "Share change": "{:+,.1f}", "Avg price": "${:,.2f}",
                 "True SBC cost": "{:,.0f}", "Owners' earnings": "{:,.0f}"}, na_rep="—"),
             width="stretch", hide_index=True)
-        st.caption("Identical to tool 1's table for the same ticker. If it is not, the two "
-                   "engines have drifted apart and the self-test at the foot will say so.")
+        st.caption(
+            f"ΔE pooled: {pooled.dE:.1%} over {pooled.years} years, {recent.dE:.1%} over the "
+            f"last three. The box above shows {plain(latest.N)} of net income times "
+            f"{use_dE:.1%}, which is how tool 1 seeds it too — the latest year as filed came in "
+            f"at {plain(latest.OE)}.")
 
         st.write("**Assumptions used** — paste this if something looks wrong")
         st.code(
-            f"{tk}   price {price:,.2f}   shares {shares:,.1f}M   mkt cap {money(mcap)}\n"
-            f"owners' earnings    {OE:,.0f} M\n"
-            f"ROIC latest         "
-            + (f"{roic_now:.2%}" if roic_now is not None else f"n/a ({latest_r.reason})") + "\n"
+            f"{tk}   price {price:,.2f}   shares {shares:,.1f}M   mkt cap {plain(mcap)}\n"
+            f"owners' earnings    {OE:,.0f} M   ({mcap/OE:,.1f}x)\n"
+            f"needs               "
+            + (f"{required:.2%}/yr" if required is not None else "n/a") + "\n"
+            f"can fund            "
+            + (f"{fundable:.2%}/yr" if fundable is not None else "n/a") + "\n"
+            f"has delivered       "
+            + (f"{delivered:.2%}/yr" if delivered is not None else "n/a") + "\n"
             f"ROIC 5y median      "
             + (f"{roic_med:.2%}" if roic_med is not None else "n/a") + "\n"
             f"invested capital    {latest_r.cap.invested:,.0f} M\n"
+            f"payout              "
+            + (f"{payout:.1%}" if payout is not None else "n/a") + "\n"
             f"other expense       {other_expense:,.0f} M   other capital {other_capital:,.0f} M\n"
             f"operating cash      {op_cash_pct:.1%} of revenue\n"
-            f"payout              {payout:.1%} of owners' earnings\n"
-            f"dilution            {dilution:+.2%}/yr   horizon {horizon}y   "
-            f"exit {exit_mult:g}x", language="text")
+            f"dilution            {dilution:+.2%}/yr   horizon {horizon}y   exit {exit_mult:g}x\n"
+            f"verdict             {v.label} ({v.why})", language="text")
 
 # ══════════════════════════════════════════════════════════════════════
 #  REFERENCE
@@ -1411,32 +1506,30 @@ _r1, _r2 = st.columns(2)
 with _r1:
     with st.expander("What the numbers mean"):
         st.markdown(
-            "**Required growth** — the annual rate in owners' earnings that turns today's price "
-            "into a hundredfold over your holding period, after the multiple you assume at the "
-            "end and the dilution along the way.\n\n"
-            "**ROIC** — Burry's fully-adjusted return on invested capital. Owners' earnings "
-            "stripped of interest income and lease payments, over the capital genuinely at work "
-            "once deployable cash is removed and operational cash left in.\n\n"
-            "**ROIC ceiling** — return on capital multiplied by the share of earnings retained, "
-            "plus the lift from any stock retired. The fastest a business compounds per share "
-            "without outside money.\n\n"
-            "**Ex-goodwill ROIC** — the same return on tangible capital. It tells you the return "
-            "on the next dollar reinvested; the all-in figure tells you how well past "
-            "acquisitions were priced.\n\n"
-            "**Dilution** — the net annual change in the share count. A hundredfold in the "
-            "business is not a hundredfold for you if the count grew the whole way.")
+            "**Needs** — the annual growth in owners' earnings that turns today's price into a "
+            "hundredfold over your holding period, after the exit multiple you assume and the "
+            "dilution along the way.\n\n"
+            "**Can fund** — return on capital multiplied by the share of earnings retained, plus "
+            "the lift from any stock retired. The fastest a business compounds per share without "
+            "outside money. A company earning 100% on capital and paying all of it out funds "
+            "almost no growth, which is why this is the number to read rather than ROIC "
+            "itself.\n\n"
+            "**Has delivered** — the better of its revenue and owners'-earnings growth over the "
+            "window. History is not a ceiling, but a price that requires a rate the company has "
+            "never reached is a bet on an inflection.\n\n"
+            "**ROIC** — Burry's fully-adjusted return on invested capital, computed on owners' "
+            "earnings over capital genuinely at work: deployable cash removed, operational cash "
+            "left in.")
 
 with _r2:
     with st.expander("Verify the engine"):
         st.caption(
-            "Two different kinds of check. The Alphabet lines re-run **Burry's published "
-            "inputs** through this page's copy of the Tragic Algebra engine and confirm it "
-            "still matches tool 1 to the dollar. The rest are arithmetic and wiring tests: "
-            "Mayer's own 25-year figure, and Burry's ROIC formula against a hand-worked "
-            "example.\n\n"
+            "Three kinds of check. The Alphabet lines re-run **Burry's published inputs** through "
+            "this page's copy of the Tragic Algebra engine and confirm it still matches tool 1 to "
+            "the dollar. The Mayer lines check the 100x arithmetic against the figures his book "
+            "leads with. The rest are wiring and verdict tests.\n\n"
             "There is no published ROIC to validate against the way Alphabet validates owners' "
-            "earnings, so the ROIC test proves the plumbing is right, not that the framework "
-            "is. That distinction is worth keeping.")
+            "earnings, so that test proves the plumbing is right, not that the framework is.")
         if st.button("Run checks"):
             for name, ok, got in self_test():
                 st.write(("✅ " if ok else "❌ ") + f"{name} — {got}")
