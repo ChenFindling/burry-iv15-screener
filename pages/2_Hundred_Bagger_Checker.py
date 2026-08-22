@@ -259,7 +259,8 @@ def reporting_currency(facts: dict, concepts: list[str]) -> str | None:
     return None
 
 
-def _instant(facts: dict, concepts: list[str], unit: str = "USD") -> dict[int, float]:
+def _instant(facts: dict, concepts: list[str], unit: str = "USD",
+             sources: list[str] | None = None) -> dict[int, float]:
     """Latest balance-sheet value per fiscal year. First concept with data wins;
     merging them silently mixes incompatible definitions."""
     for taxonomy in ("us-gaap", "dei", "ifrs-full"):
@@ -277,6 +278,8 @@ def _instant(facts: dict, concepts: list[str], unit: str = "USD") -> dict[int, f
                 if fy not in out or filed > out[fy][0]:
                     out[fy] = (filed, float(row["val"]))
             if out:
+                if sources is not None:
+                    sources.append(concept)
                 return {k: v[1] for k, v in out.items()}
     return {}
 
@@ -297,7 +300,8 @@ def _instant_first(facts: dict, groups: list[list[str]],
     return {}, -1
 
 
-def _instant_sum(facts: dict, groups: list[list[str]]) -> dict[int, float]:
+def _instant_sum(facts: dict, groups: list[list[str]],
+                 sources: list[str] | None = None) -> dict[int, float]:
     """Sum of several independent balance-sheet lines, per year.
 
     A missing component is treated as zero, which is right far more often than
@@ -307,7 +311,7 @@ def _instant_sum(facts: dict, groups: list[list[str]]) -> dict[int, float]:
     """
     out: dict[int, float] = {}
     for g in groups:
-        for fy, v in _instant(facts, g).items():
+        for fy, v in _instant(facts, g, "USD", sources).items():
             out[fy] = out.get(fy, 0.0) + v
     return out
 
@@ -862,16 +866,21 @@ def load(ticker: str, n_years: int = 10):
     # Parent-only equity is preferred because net income is parent-only too.
     # Mixing a consolidated capital base with a parent's earnings understates
     # the return by exactly the minority's share.
-    eq = _instant(facts, EQUITY[0]) or _instant(facts, EQUITY[1])
+    bal: dict[str, list[str]] = {k: [] for k in
+                                 ("equity", "debt", "leases", "cash", "investments", "goodwill")}
+    eq = _instant(facts, EQUITY[0], "USD", bal["equity"]) or \
+        _instant(facts, EQUITY[1], "USD", bal["equity"])
     minority = _instant_sum(facts, MINORITY)
-    debt = _instant_sum(facts, DEBT)
-    fin_lease = _instant_sum(facts, FIN_LEASE)
-    op_lease = _instant_sum(facts, OP_LEASE)
+    debt = _instant_sum(facts, DEBT, bal["debt"])
+    fin_lease = _instant_sum(facts, FIN_LEASE, bal["leases"])
+    op_lease = _instant_sum(facts, OP_LEASE, bal["leases"])
     restricted = _instant_sum(facts, RESTRICTED)
     cash_ser, which = _instant_first(facts, [CASH_PLAIN, CASH_WITH_RESTRICTED])
-    invest = _instant_sum(facts, INVESTMENTS)
-    goodwill = _instant_sum(facts, GOODWILL)
-    intang = _instant_sum(facts, INTANGIBLES)
+    if cash_ser:
+        bal["cash"].append(CASH_PLAIN[0] if which == 0 else CASH_WITH_RESTRICTED[0])
+    invest = _instant_sum(facts, INVESTMENTS, bal["investments"])
+    goodwill = _instant_sum(facts, GOODWILL, bal["goodwill"])
+    intang = _instant_sum(facts, INTANGIBLES, bal["goodwill"])
     rev = series.get("REV", {})
 
     if which == 1:
@@ -953,7 +962,26 @@ def load(ticker: str, n_years: int = 10):
         "proxy": proxy,
         "form4": _form4_count(subs),
         "cik": str(int(cik)), "fye_month": fye_month,
-        "tags": tag_report(facts, series, tag_sources),
+        "tags": tag_report(facts, series, tag_sources) + [
+            {"Line": "— Shareholders' equity", "Years read": len(eq),
+             "XBRL tag": " + ".join(bal["equity"]) or "—",
+             "Status": "read" if eq else "no equity tag found — ROIC cannot be built"},
+            {"Line": "— Borrowings", "Years read": len(debt),
+             "XBRL tag": " + ".join(bal["debt"]) or "—",
+             "Status": "read" if debt else "none found (many companies genuinely have none)"},
+            {"Line": "— Leases", "Years read": len(op_lease) + len(fin_lease),
+             "XBRL tag": " + ".join(bal["leases"]) or "—",
+             "Status": "read" if (op_lease or fin_lease) else "none found"},
+            {"Line": "— Cash", "Years read": len(cash_ser),
+             "XBRL tag": " + ".join(bal["cash"]) or "—",
+             "Status": "read" if cash_ser else "no cash tag found"},
+            {"Line": "— Investments", "Years read": len(invest),
+             "XBRL tag": " + ".join(bal["investments"]) or "—",
+             "Status": "read" if invest else "none found"},
+            {"Line": "— Goodwill & intangibles", "Years read": len(goodwill) + len(intang),
+             "XBRL tag": " + ".join(bal["goodwill"]) or "—",
+             "Status": "read" if (goodwill or intang) else "none found"},
+        ],
     }
     return years, notes, pre
 
@@ -1026,6 +1054,9 @@ def assess(required: float | None, fundable: float | None,
     # ceilings are generous here — delivered takes the better of revenue and
     # owners' earnings — so failing this one is a real finding.
     if delivered is not None and required > max(delivered * 1.5, delivered + 0.03):
+        if fundable is None:
+            return Verdict("Unprecedented, and no ceiling to check it against",
+                           "warning", "history only")
         return Verdict("Fundable, but unprecedented", "warning", "history")
     if fundable is None:
         return Verdict("Open, on history alone", "info", "no capital base")
@@ -1231,6 +1262,18 @@ def self_test() -> list[tuple[str, bool, str]]:
     src = []
     _annual(facts, CONCEPTS["T"][0], [], src, True)
     out.append(("...and both tags are named in the panel", len(src) == 2, " + ".join(src)))
+
+    # 4e. The CXDO crash: needs above what history has done, with no capital
+    #     base at all. It used to claim "fundable" about a number that did not
+    #     exist, then format None as a percentage and take the page down.
+    v = assess(0.38, None, 0.25, 198)
+    out.append(("No capital base does not get called 'fundable'",
+                v.why == "history only" and v.kind == "warning", f"{v.label} ({v.why})"))
+    every = [assess(0.38, None, 0.25, 198), assess(0.20, None, None, 198),
+             assess(0.20, 0.30, None, 198), assess(0.10, None, 0.25, 198),
+             assess(None, None, None, 198), assess(0.20, 0.30, 0.25, 9e9)]
+    out.append(("Every verdict a missing ceiling can produce is reachable",
+                len({x.why for x in every}) == 6, ", ".join(sorted(x.why for x in every))))
 
     # 5. The verdict itself.
     v = assess(0.272, 0.075, 0.04, 5_000)
@@ -1458,7 +1501,9 @@ if years and ticker and st.session_state.get("hb_tk") == ticker:
     m3.metric("Can fund", f"{fundable:.1%}" if fundable is not None else "n/a",
               (f"ROIC {roic_med:.0%} · retains {max(0.0,1-payout):.0%}"
                if fundable is not None else
-               "financial company" if financial else "capital base unread"))
+               "financial company" if financial else
+               "no owners' earnings to divide" if payout is None else
+               (latest_r.reason or "capital base unread")))
 
     if pay.warning:
         st.warning("**Check this before trusting the ceiling.** " + pay.warning)
@@ -1497,6 +1542,14 @@ if years and ticker and st.session_state.get("hb_tk") == ticker:
             + " The gap would have to come from outside — debt, which runs out, or stock, which "
               "is the dilution you already set. Raising the exit multiple is the only other "
               "lever, and that is a bet on the market, not on the business.")
+    elif v.why == "history only":
+        st.warning(
+            f"**{v.label}.** A hundredfold in {horizon} years needs {required:.1%} a year, and "
+            f"the company has delivered {delivered:.1%} — the kinder of its revenue and "
+            "owners'-earnings rates. Return on capital could not be read for this filer, so "
+            "there is no funding ceiling to set against it and half this page is missing. "
+            "The reason is in the ROIC section below; the tag panel usually says which line "
+            "did not load.")
     elif v.why == "history":
         st.warning(
             f"**{v.label}.** {required:.1%} a year is inside the {fundable:.1%} its capital could "
@@ -1510,6 +1563,11 @@ if years and ticker and st.session_state.get("hb_tk") == ticker:
             f"its capital funds and the {delivered:.1%} it has delivered. That makes a "
             "hundredfold possible, not likely. Everything now turns on how long the return on "
             "capital and the runway last, which no filing can tell you.")
+    elif v.why == "no ceiling of either kind":
+        st.error(
+            f"**{v.label}.** {required:.1%} a year is what the price requires, and neither "
+            "ceiling could be built: no readable capital base and too little growth history. "
+            "There is nothing here to check that number against.")
     else:
         st.info(
             f"**{v.label}.** {required:.1%} a year, checked against only one ceiling — "
