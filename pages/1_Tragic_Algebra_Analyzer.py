@@ -414,9 +414,12 @@ CONCEPTS = {
            ["ProfitLoss", "ProfitLossAttributableToOwnersOfParent"]),
     "G":  (["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"],
            ["ShareBasedPaymentsExpense"]),
-    "T":  (["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity"],
+    "T":  (["PaymentsForRepurchaseOfCommonStock", "PaymentsForRepurchaseOfEquity",
+            "PaymentsForRepurchaseOfCommonStockAndRestrictedStockUnits",
+            "StockRepurchasedAndRetiredDuringPeriodValue"],
            ["PaymentsToAcquireOrRedeemEntitysShares"]),
-    "Cw": (["PaymentsRelatedToTaxWithholdingForShareBasedCompensation"], []),
+    "Cw": (["PaymentsRelatedToTaxWithholdingForShareBasedCompensation",
+            "TreasuryStockValueAcquiredCostMethod"], []),
     "Ce": (["ProceedsFromIssuanceOfSharesUnderIncentiveAndShareBasedCompensationPlans",
             "ProceedsFromStockOptionsExercised", "ProceedsFromIssuanceOfTreasuryStock",
             "ProceedsFromSaleOfTreasuryStock", "ProceedsFromStockPlans",
@@ -483,13 +486,38 @@ def _facts(cik: str) -> dict:
                     timeout=30).json()
 
 
-def _annual(facts: dict, us: list[str], ifrs: list[str]) -> dict[int, tuple[str, str, float]]:
+# Lines where a second tag means the same thing, so a gap in one can be filled
+# from another. Deliberately not net income, stock comp, revenue or share
+# counts: their alternates carry different definitions (parent-only versus
+# consolidated, per-plan versus total, ASC 606 versus legacy), and stitching
+# those across years would put a step change in a growth rate and call it
+# history.
+FILL_KEYS = {"T", "Cw", "Ce", "DIV", "INT", "LEASEPAY", "CAPEX", "MA", "OFFER", "CONV"}
+
+
+def _annual(facts: dict, us: list[str], ifrs: list[str],
+            sources: list[str] | None = None,
+            fill: bool = False) -> dict[int, tuple[str, str, float]]:
     """{fy: (start, end, value)} for full-year facts from annual reports only.
 
     Three filters that matter: the period must be roughly a year (so quarterly
     rows tagged fp='FY' cannot slip through); annual forms only; and where a
     year appears in several filings, keep the latest — a 10-K restates the
     prior year as a comparative.
+
+    On the choice between concepts: the first one with data used to win
+    outright, and everything after it was ignored. That is right when the
+    alternates mean different things, and quietly wrong when they do not.
+    H&R Block retired shares rather than holding them as treasury, so
+    PaymentsForRepurchaseOfCommonStock covered three of nineteen years and the
+    remaining sixteen sat in StockRepurchasedAndRetiredDuringPeriodValue —
+    unread, because three years was enough to stop the search. The buyback
+    column printed zeros for a decade and every figure downstream inherited it.
+
+    With fill=True the concepts are tried in order and later ones fill only the
+    years earlier ones left empty. Priority is preserved; nothing is summed;
+    and every concept that contributed is appended to `sources` so the panel in
+    the UI can show which ones answered.
     """
     out: dict[int, tuple[str, str, str, float]] = {}
     for taxonomy, concepts in (("us-gaap", us), ("ifrs-full", ifrs)):
@@ -498,20 +526,27 @@ def _annual(facts: dict, us: list[str], ifrs: list[str]) -> dict[int, tuple[str,
             if concept not in tax:
                 continue
             units = tax[concept].get("units", {})
+            got: dict[int, tuple[str, str, str, float]] = {}
             for row in units.get("USD", []) or units.get("shares", []):
                 if row.get("form") not in ANNUAL_FORMS:
                     continue
                 start, end = row.get("start"), row.get("end")
                 if not (start and end):
                     continue
-                if not 330 <= (dt.date.fromisoformat(end) - dt.date.fromisoformat(start)).days <= 400:
+                if not 330 <= (dt.date.fromisoformat(end)
+                               - dt.date.fromisoformat(start)).days <= 400:
                     continue
                 fy, filed = int(end[:4]), row.get("filed", "")
-                if fy not in out or filed > out[fy][0]:
-                    out[fy] = (filed, start, end, float(row.get("val", 0.0)))
-            if out:
+                if fy not in got or filed > got[fy][0]:
+                    got[fy] = (filed, start, end, float(row.get("val", 0.0)))
+            fresh = {fy: v for fy, v in got.items() if fy not in out}
+            if fresh:
+                out.update(fresh)
+                if sources is not None:
+                    sources.append(concept)
+            if out and not fill:
                 return {k: (v[1], v[2], v[3]) for k, v in out.items()}
-    return {}
+    return {k: (v[1], v[2], v[3]) for k, v in out.items()}
 
 
 def reporting_currency(facts: dict, concepts: list[str]) -> str | None:
@@ -650,6 +685,47 @@ def split_adjust(shares: dict[int, float]) -> tuple[dict[int, float], list[str]]
     return adjusted, notes
 
 
+TAG_LABELS = {
+    "N": "Net income", "G": "GAAP stock comp", "T": "Buybacks",
+    "Cw": "Tax withheld on vesting", "Ce": "Option / ESPP proceeds",
+    "REV": "Revenue", "INT": "Interest income", "LEASEPAY": "Finance lease payments",
+    "DIV": "Dividends paid", "CAPEX": "Capital expenditure",
+    "MA": "Shares issued for acquisitions", "OFFER": "Shares issued in offerings",
+    "CONV": "Shares from conversions",
+}
+
+
+def tag_report(facts: dict, series: dict, sources: dict[str, list[str]]) -> list[dict]:
+    """Which tags answered for each line, and how many years they covered.
+
+    Every silent zero in this app is a tag that did not match. Reading the
+    panel is how the H&R Block buyback bug was found: the tag was there, it
+    covered three years of nineteen, and nothing said so.
+    """
+    rows = []
+    for key, (us, ifrs) in CONCEPTS.items():
+        used = sources.get(key, [])
+        n = len(series.get(key, {}))
+        present = ""
+        for taxonomy, concepts in (("us-gaap", us), ("ifrs-full", ifrs)):
+            for c in concepts:
+                if c in facts.get("facts", {}).get(taxonomy, {}):
+                    present = c
+                    break
+            if present:
+                break
+        rows.append({
+            "Line": TAG_LABELS.get(key, key),
+            "Years read": n,
+            "XBRL tag": " + ".join(used) if used else (present or "—"),
+            "Status": ("read" if n and len(used) <= 1 else
+                       f"read — gaps filled from {len(used)} tags" if n else
+                       "tag present but no annual figures survived the filters" if present else
+                       "none of the tags this reader knows are in the filing"),
+        })
+    return rows
+
+
 def load(ticker: str, n_years: int = 10):
     cmap = _ticker_map()
     if ticker not in cmap:
@@ -657,7 +733,9 @@ def load(ticker: str, n_years: int = 10):
     facts = _facts(cmap[ticker])
     sic, sic_desc = _sic(cmap[ticker])
 
-    series = {k: _annual(facts, us, ifrs) for k, (us, ifrs) in CONCEPTS.items()}
+    tag_sources: dict[str, list[str]] = {k: [] for k in CONCEPTS}
+    series = {k: _annual(facts, us, ifrs, tag_sources[k], k in FILL_KEYS)
+              for k, (us, ifrs) in CONCEPTS.items()}
     if not series["N"]:
         ccy = reporting_currency(facts, CONCEPTS["N"][0] + CONCEPTS["N"][1])
         if ccy and ccy != "USD":
@@ -744,6 +822,33 @@ def load(ticker: str, n_years: int = 10):
             "usually means shares issued for something other than pay — an offering, an "
             "acquisition or a preferred conversion — are being counted as compensation. Treat ΔE "
             "here as a floor, not a measurement.")
+
+    if "TreasuryStockValueAcquiredCostMethod" in tag_sources.get("Cw", []):
+        capped = 0
+        for y in years:
+            if y.G > 0 and y.Cw > 3 * y.G:
+                y.Cw, capped = 0.0, capped + 1
+        if capped:
+            notes.append(
+                f"A treasury-stock line was read as tax withholding, but in {capped} year(s) it "
+                "was more than three times the GAAP stock-comp charge — too large to be shares "
+                "surrendered for employee tax, and almost certainly an ordinary repurchase. Those "
+                "years were dropped rather than charged twice, once as withholding and again as "
+                "the market value of shares delivered.")
+        else:
+            notes.append(
+                "Tax withholding was read from a treasury-stock line rather than the usual "
+                "withholding tag. Filers that retire shares on repurchase report it this way.")
+
+    _neg = [y for y in years if y.omega < 0 and not y.excluded]
+    if len(_neg) >= max(2, len(years) // 3):
+        notes.append(
+            f"The true stock-comp cost reads negative in {len(_neg)} of {len(years)} years, which "
+            "ADDS to owners' earnings instead of subtracting and pushes ΔE above 100%. It happens "
+            "legitimately when option and ESPP proceeds exceed the tax withheld, but it is also "
+            "what a missing buyback or issuance line looks like. Check the tag panel below: if "
+            "buybacks read fewer years than net income, that is the cause and ΔE here is a "
+            "ceiling rather than a measurement.")
 
     if any(y.price == 0 for y in years):
         notes.append("No share price for some years — their SBC cost is understated.")
@@ -834,9 +939,10 @@ def load(ticker: str, n_years: int = 10):
                 "surge is genuinely still ahead, use the hypergrowth years in Model settings "
                 "instead of raising this.")
 
+    tags = tag_report(facts, series, tag_sources)
     _kept_oe = sorted(y.OE for y in years[-5:] if not y.excluded)
     _med = _kept_oe[len(_kept_oe) // 2] if _kept_oe else 0.0
-    return years, notes, {"net_cash": net_cash, "cash": cash_total, "debt": debt_total,
+    return years, notes, {"tags": tags, "net_cash": net_cash, "cash": cash_total, "debt": debt_total,
                           "median_OE": _med, "revenue": latest_rev, "cagr3": cagr3,
                           "leases": lease_total,
                           "shares": diluted, "growth": growth, "sic": sic,
@@ -1428,6 +1534,13 @@ if years and ticker and st.session_state.get("tk") == ticker:
                 "Share change": "{:+,.1f}", "Avg price": "${:,.2f}", "True SBC cost": "{:,.0f}",
                 "Owners' earnings": "{:,.0f}", "ΔE": "{:.1%}"}, na_rep="—"),
             width='stretch', hide_index=True)
+
+        st.write("**What was read from the filings** — every tag, found or missing")
+        st.dataframe(pd.DataFrame(pre.get("tags", [])), width='stretch', hide_index=True)
+        st.caption(
+            "A zero in this app is either something the company did not do or a tag this reader "
+            "does not know. If a line you know exists reads fewer years than net income, that is "
+            "a bug worth reporting — the tag name is the whole fix.")
 
         st.write("**Assumptions used** — paste this if something looks wrong")
         st.code(
